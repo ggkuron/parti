@@ -17,23 +17,25 @@ pub type ColorFormat = gfx::format::Rgba8;
 pub type DepthFormat = gfx::format::DepthStencil;
 use rusqlite::types::ToSql;
 
-use cgmath::{
+use cgmath:: {
     EuclideanSpace,
     Point3,
     Vector3,
     Matrix4,
-    // One,
-    // Zero,
-    // InnerSpace
+    One,
+    Zero,
     // Rotation,
     // Quaternion,
 };
 
 
 pub fn main() {
-    let mut conn = Connection::open(&Path::new("test.sqlite3")).unwrap();
-    // create_table(&conn);
-    // register_collada(&mut conn).unwrap();
+    // let mut conn = Connection::open(&Path::new("test.sqlite3")).unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
+    create_table(&conn);
+    register_collada(&mut conn, 1, "assets/house.dae").unwrap();
+
+
 
     let width = 1024;
     let height = 768;
@@ -102,7 +104,7 @@ pub fn main() {
                 vbuf: entry.vertex_buffer.clone(),
                 u_model_view_proj: camera.projection.into(),
                 u_model_view: camera.view.into(),
-                u_light: [1.0, 1.0, -0.5f32],
+                u_light: [1.0, 0.0, -0.5f32],
                 u_ambient_color: [0.01, 0.01, 0.01, 1.0],
                 u_eye_direction: camera.direction().into(),
                 out: main_color.clone(),
@@ -148,9 +150,9 @@ struct Camera<T> {
 
 impl<T: cgmath::BaseFloat> Camera<T> {
     fn new(pos: Point3<T>, target: Point3<T>, perspective: cgmath::PerspectiveFov<T>) -> Camera<T> {
-        let view = Matrix4::look_at(pos
-                                   ,Point3::origin()
-                                   ,Vector3::new(cgmath::Zero::zero(), cgmath::Zero::zero(), cgmath::One::one()));
+        let view = Matrix4::look_at( pos
+                                   , Point3::origin()
+                                   , Vector3::new(Zero::zero(), Zero::zero(), One::one()));
         let pers = Matrix4::from(perspective);
         Camera {
             pos: pos,
@@ -164,7 +166,7 @@ impl<T: cgmath::BaseFloat> Camera<T> {
         self.pos += v;
         self.view = Matrix4::look_at(self.pos
                                     ,self.target
-                                    ,Vector3::new(cgmath::Zero::zero(), cgmath::Zero::zero(), cgmath::One::one()));
+                                    ,Vector3::new(Zero::zero(), Zero::zero(), One::one()));
         self.projection = self.perspective * self.view;
     }
     fn direction(& self) -> Vector3<T>{
@@ -219,11 +221,8 @@ fn vtn_to_vertex(a: collada::VTNIndex, obj: &collada::Object) -> Vertex {
     vertex
 }
 
-fn register_collada(conn: &mut Connection) -> rusqlite::Result<()> {
+fn register_collada(conn: &mut Connection, object_id: i32, collada_name: &str) -> rusqlite::Result<()> {
     let tx = try!(conn.transaction());
-    let collada_name = "assets/human21.dae";
-    let object_id = 1;
-
     let collada_doc = ColladaDocument::from_path(&Path::new(collada_name)).unwrap();
     let collada_objs = collada_doc.get_obj_set().unwrap();
 
@@ -397,9 +396,9 @@ SELECT
 , MV.JointWeight3
 , MV.JointWeight4
   FROM Object AS O
-INNER JOIN Mesh AS M
+LEFT JOIN Mesh AS M
   ON O.ObjectId = M.ObjectId
-INNER JOIN MeshVertex AS MV
+LEFT JOIN MeshVertex AS MV
   ON M.ObjectId = MV.ObjectId
   and M.MeshId = MV.MeshId
 WHERE O.ObjectId = $1
