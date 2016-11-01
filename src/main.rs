@@ -5,9 +5,11 @@ extern crate glutin;
 extern crate collada;
 extern crate cgmath;
 extern crate rusqlite;
+extern crate png;
 
 use gfx::traits::FactoryExt;
 use gfx::Device;
+use gfx::Factory;
 
 use std::path::Path;
 use collada::document::ColladaDocument;
@@ -28,14 +30,11 @@ use cgmath:: {
     // Quaternion,
 };
 
-
 pub fn main() {
     // let mut conn = Connection::open(&Path::new("test.sqlite3")).unwrap();
     let mut conn = Connection::open_in_memory().unwrap();
     create_table(&conn);
     register_collada(&mut conn, 1, "assets/house.dae").unwrap();
-
-
 
     let width = 1024;
     let height = 768;
@@ -52,6 +51,16 @@ pub fn main() {
         include_bytes!("shader/150.glslf"),
         pipe::new()
     ).unwrap();
+
+
+    let sampler = factory.create_sampler(
+                    gfx::tex::SamplerInfo::new(
+                        gfx::tex::FilterMethod::Trilinear,
+                        gfx::tex::WrapMode::Clamp
+                    )
+                  );
+
+    let texture = open_texture(&mut factory, &std::path::Path::new("assets/l_h.png"));
 
     let mut entries = Vec::new();
 
@@ -107,6 +116,7 @@ pub fn main() {
                 u_light: [1.0, 0.0, -0.5f32],
                 u_ambient_color: [0.01, 0.01, 0.01, 1.0],
                 u_eye_direction: camera.direction().into(),
+                u_texture: (texture.view.clone(), sampler.clone()),
                 out: main_color.clone(),
                 out_depth: main_depth.clone()
             };
@@ -134,6 +144,7 @@ gfx_defines!{
         u_light: gfx::Global<[f32; 3]> = "u_light",
         u_ambient_color: gfx::Global<[f32; 4]> = "u_ambientColor",
         u_eye_direction: gfx::Global<[f32; 3]> = "u_eyeDirection",
+        u_texture: gfx::TextureSampler<[f32; 4]> = "u_texture",
         out: gfx::RenderTarget<ColorFormat> = "Target0",
         out_depth: gfx::DepthTarget<gfx::format::DepthStencil> = gfx::preset::depth::LESS_EQUAL_WRITE,
     }
@@ -226,7 +237,7 @@ fn register_collada(conn: &mut Connection, object_id: i32, collada_name: &str) -
     let collada_doc = ColladaDocument::from_path(&Path::new(collada_name)).unwrap();
     let collada_objs = collada_doc.get_obj_set().unwrap();
 
-    insert_object(&tx, object_id, "human", &collada_name);
+    insert_object(&tx, object_id, "human", &collada_name).unwrap();
 
     for (i, obj) in collada_objs.objects.iter().enumerate() {
         register_collada_object(&tx, &obj, object_id, i as i32 + 1)
@@ -234,13 +245,13 @@ fn register_collada(conn: &mut Connection, object_id: i32, collada_name: &str) -
     tx.commit()
 }
 
-fn register_collada_object(tx: &rusqlite::Transaction, obj: &collada::Object, objectId: i32, mesh_id: i32) {
+fn register_collada_object(tx: &rusqlite::Transaction, obj: &collada::Object, object_id: i32, mesh_id: i32) {
     let mut i = 0;
-    insert_mesh(&tx, objectId, mesh_id, &obj.name);
+    insert_mesh(&tx, object_id, mesh_id, &obj.name).unwrap();
     for geom in obj.geometry.iter() {
        let mut add = |a: collada::VTNIndex| {
            i += 1;
-           insert_vertex(&tx, objectId, mesh_id, &vtn_to_vertex(a, obj), i);
+           insert_vertex(&tx, object_id, mesh_id, &vtn_to_vertex(a, obj), i).ok()
        };
        for shape in geom.shapes.iter() {
            match shape {
@@ -433,6 +444,50 @@ Order By MV.ObjectId, MV.MeshId, MV.IndexNo
        meshes[mesh_id - 1].push(v);
    }
    meshes
+}
+pub fn open_texture<F,R>(factory: &mut F, path: &std::path::Path) -> Texture<R>
+    where R: gfx::Resources,
+          F: gfx::Factory<R>
+{
+    use std::fmt;
+    use std::io::{self, Read, Write, BufRead, BufReader, BufWriter};
+    use png::{self, Reader};
+    let fin = std::fs::File::open(path).unwrap();
+    let mut fin = BufReader::new(fin);
+    let dec = png::Decoder::new(fin);
+    let (_, mut reader) = dec.read_info().unwrap();
+    // let color = reader.output_color_type().into();
+    let mut data = vec![0; reader.output_buffer_size()];
+    reader.next_frame(&mut data).ok();
+    let (w, h) = reader.info().size(); 
+    // let image = match (color, data) {
+    //     (color::ColorType::RGBA(8), data) => {
+    //         (w
+
+    //     }
+    // };
+
+    let tex_kind = gfx::tex::Kind::D2(w as u16, h as u16,
+                                      gfx::tex::AaMode::Single);
+    let filter = gfx::tex::FilterMethod::Bilinear;
+
+    let sampler_info = gfx::tex::SamplerInfo::new(
+        filter,
+        gfx::tex::WrapMode::Clamp);
+
+
+
+    let (surface, view) = factory.create_texture_const_u8::<gfx::format::Srgba8>(
+                            tex_kind, &[&data]).unwrap();
+    let sampler = factory.create_sampler(sampler_info);
+
+    Texture { surface: surface, sampler: sampler, view: view }
+}
+
+pub struct Texture<R> where R: gfx::Resources {
+    pub surface: gfx::handle::Texture<R, gfx::format::R8_G8_B8_A8>,
+    pub sampler: gfx::handle::Sampler<R>,
+    pub view: gfx::handle::ShaderResourceView<R, [f32; 4]>
 }
 
 
