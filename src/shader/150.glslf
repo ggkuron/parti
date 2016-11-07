@@ -5,8 +5,6 @@ uniform vec4 u_ambientColor;
 uniform vec3 u_eyeDirection;
 uniform sampler2D u_texture;
 
-in vec4 v_Color;
-
 in vec2 v_TexCoord;
 
 smooth in vec3 _normal;

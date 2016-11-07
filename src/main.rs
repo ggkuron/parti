@@ -7,10 +7,6 @@ extern crate cgmath;
 extern crate rusqlite;
 extern crate png;
 
-use gfx::traits::FactoryExt;
-use gfx::Device;
-use gfx::Factory;
-
 use std::path::Path;
 use collada::document::ColladaDocument;
 use rusqlite::Connection;
@@ -31,10 +27,14 @@ use cgmath:: {
 };
 
 pub fn main() {
-    // let mut conn = Connection::open(&Path::new("test.sqlite3")).unwrap();
-    let mut conn = Connection::open_in_memory().unwrap();
+    use gfx::traits::FactoryExt;
+    use gfx::Device;
+    use gfx::Factory;
+
+    let mut conn = Connection::open(&Path::new("test.sqlite")).unwrap();
+    // let mut conn = Connection::open_in_memory().unwrap();
     create_table(&conn);
-    register_collada(&mut conn, 1, "assets/house.dae").unwrap();
+    register_collada(&mut conn, 1, "assets/human31.dae", 1, "assets/h.png",).unwrap();
 
     let width = 1024;
     let height = 768;
@@ -45,26 +45,27 @@ pub fn main() {
     let (window, mut device, mut factory, main_color, main_depth) =
         gfx_window_glutin::init::<ColorFormat, DepthFormat>(builder);
 
-    let mut encoder: gfx::Encoder<_, _> = factory.create_command_buffer().into();
     let pso = factory.create_pipeline_simple(
         include_bytes!("shader/150.glslv"),
         include_bytes!("shader/150.glslf"),
         pipe::new()
     ).unwrap();
 
-
-    let sampler = factory.create_sampler(
-                    gfx::tex::SamplerInfo::new(
-                        gfx::tex::FilterMethod::Trilinear,
-                        gfx::tex::WrapMode::Clamp
-                    )
-                  );
-
-    let texture = open_texture(&mut factory, &std::path::Path::new("assets/l_h.png"));
+    let sampler_info = gfx::tex::SamplerInfo::new(
+        gfx::tex::FilterMethod::Trilinear,
+        gfx::tex::WrapMode::Clamp);
+    let sampler = factory.create_sampler(sampler_info);
 
     let mut entries = Vec::new();
 
     let result = query_mesh(&conn, 1);
+    let img = query_texture(&conn, 1);
+    let tex_kind = gfx::tex::Kind::D2(img.width, img.height,
+                                      gfx::tex::AaMode::Single);
+    let (_, view) = factory.create_texture_const_u8::<gfx::format::Srgba8>(
+                            tex_kind, &[&img.data]).unwrap();
+
+
     for vertex_data in result
     {
         let index_data: Vec<u32> = vertex_data.iter().enumerate().map(|(i, _)| i as u32).collect();
@@ -78,29 +79,19 @@ pub fn main() {
     let mut camera = Camera::new(Point3::new(0.0, -7.0, 0.0),
                                  Point3::origin(),
                                  cgmath::PerspectiveFov  {
-                                     fovy: cgmath::Rad(120.0f32.to_radians()),
+                                     fovy: cgmath::Rad(105.0f32.to_radians()),
                                      aspect: (width as f32) / (height as f32),
                                      near: 0.001,
                                      far: 1000.0,
                                  });
 
+    let mut encoder: gfx::Encoder<_, _> = factory.create_command_buffer().into();
+
     'main: loop {
         for event in window.poll_events() {
-            match event {
-                glutin::Event::KeyboardInput(_, _, Some(glutin::VirtualKeyCode::Escape)) |
-                glutin::Event::Closed => break 'main,
-                glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::L)) 
-                    => { camera.move_pos(Vector3::new(-0.5,0.0,0.0)); },
-                glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::H)) 
-                    => { camera.move_pos(Vector3::new(0.5,0.0,0.0)); },
-                glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::J)) 
-                    => { camera.move_pos(Vector3::new(0.0,0.0,0.5)); },
-                glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::K)) 
-                    => { camera.move_pos(Vector3::new(0.0,0.0,-0.5)); },
-                glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::Z)) 
-                    => { camera.move_pos(Vector3::new(0.0,0.5,0.0)); },
-                glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::X)) 
-                    => { camera.move_pos(Vector3::new(0.0,-0.5,0.0)); },
+            match event_handler(event) {
+                GameCommand::Exit => break 'main,
+                GameCommand::CameraMove(v) => camera.translate(v),
                 _ => {}
             }
         }
@@ -116,7 +107,7 @@ pub fn main() {
                 u_light: [1.0, 0.0, -0.5f32],
                 u_ambient_color: [0.01, 0.01, 0.01, 1.0],
                 u_eye_direction: camera.direction().into(),
-                u_texture: (texture.view.clone(), sampler.clone()),
+                u_texture: (view.clone(), sampler.clone()),
                 out: main_color.clone(),
                 out_depth: main_depth.clone()
             };
@@ -128,12 +119,43 @@ pub fn main() {
     }
 }
 
+enum GameCommand {
+    CameraMove (Vector3<f32>),
+    Exit,
+    NOP
+}
+
+fn event_handler(ev :glutin::Event) -> GameCommand {
+    match ev {
+        glutin::Event::KeyboardInput(_, _, Some(glutin::VirtualKeyCode::Escape)) |
+        glutin::Event::Closed => GameCommand::Exit,
+        glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::L)) 
+            => GameCommand::CameraMove(Vector3::new(0.5,0.0,0.0)),
+        glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::H)) 
+            => GameCommand::CameraMove(Vector3::new(-0.5,0.0,0.0)),
+        glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::J)) 
+            => GameCommand::CameraMove(Vector3::new(0.0,0.0,-0.5)),
+        glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::K)) 
+            => GameCommand::CameraMove(Vector3::new(0.0,0.0,0.5)),
+        glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::Z)) 
+            => GameCommand::CameraMove(Vector3::new(0.0,0.5,0.0)),
+        glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::X)) 
+            => GameCommand::CameraMove(Vector3::new(0.0,-0.5,0.0)),
+        _ => GameCommand::NOP
+    }
+}
+
+struct Image {
+    data: Vec<u8>,
+    width: u16,
+    height: u16
+}
+
 gfx_defines!{
     vertex Vertex {
         pos: [f32; 3] = "position",
         normal: [f32; 3] = "normal",
         uv: [f32; 2] = "uv",
-        color: [f32; 3] = "a_Color",
         joint_indices: [i32; 4] = "joint_indices",
         joint_weights: [f32; 4] = "joint_weights",
     }
@@ -173,14 +195,14 @@ impl<T: cgmath::BaseFloat> Camera<T> {
             projection: pers * view
         }
     }
-    fn move_pos(&mut self, v: Vector3<T>){
+    fn translate(&mut self, v: Vector3<T>) {
         self.pos += v;
         self.view = Matrix4::look_at(self.pos
                                     ,self.target
                                     ,Vector3::new(Zero::zero(), Zero::zero(), One::one()));
         self.projection = self.perspective * self.view;
     }
-    fn direction(& self) -> Vector3<T>{
+    fn direction(& self) -> Vector3<T> {
         self.target - self.pos
     }
 }
@@ -191,7 +213,6 @@ impl Default for Vertex {
             pos: [0.0; 3],
             normal: [0.0; 3],
             uv: [0.0; 2],
-            color: [0.0; 3],
             joint_indices: [0; 4],
             joint_weights: [0.0; 4]
         }
@@ -232,12 +253,15 @@ fn vtn_to_vertex(a: collada::VTNIndex, obj: &collada::Object) -> Vertex {
     vertex
 }
 
-fn register_collada(conn: &mut Connection, object_id: i32, collada_name: &str) -> rusqlite::Result<()> {
+fn register_collada(conn: &mut Connection, object_id: i32, collada_name: &str, texture_id: i32, texture_name: &str) -> rusqlite::Result<()> {
     let tx = try!(conn.transaction());
+
+    let img = open_texture(&std::path::Path::new(texture_name));
     let collada_doc = ColladaDocument::from_path(&Path::new(collada_name)).unwrap();
     let collada_objs = collada_doc.get_obj_set().unwrap();
 
-    insert_object(&tx, object_id, "human", &collada_name).unwrap();
+    insert_object(&tx, object_id, &collada_name, texture_id).unwrap();
+    insert_texture(&tx, texture_id, &texture_name, img).unwrap();
 
     for (i, obj) in collada_objs.objects.iter().enumerate() {
         register_collada_object(&tx, &obj, object_id, i as i32 + 1)
@@ -271,7 +295,7 @@ fn create_table(conn: &Connection) {
 CREATE TABLE Object 
   ( ObjectId    INTEGER PRIMARY KEY,
     Name        TEXT NOT NULL,
-    ColladaFile TEXT NOT NULL
+    TextureId   INTEGER NOT NULL
   );
 ", &[]).unwrap(); 
    conn.execute("
@@ -279,12 +303,16 @@ CREATE TABLE Mesh
   ( ObjectId  INTEGER NOT NULL,
     MeshId    INTEGER NOT NULL,
     Name      TEXT NOT NULL,
-    Texture   TEXT,
-    DiffuseR  REAL NOT NULL,
-    DiffuseG  REAL NOT NULL,
-    DiffuseB  REAL NOT NULL,
-    DiffuseA  REAL NOT NULL,
     PRIMARY KEY (ObjectId, MeshId)
+  );", &[]).unwrap(); 
+   conn.execute("
+CREATE TABLE Texture
+  ( TextureId  INTEGER NOT NULL,
+    Name      TEXT NOT NULL,
+    Width     INTEGER NOT NULL,
+    Height    INTEGER NOT NULL,
+    Data   Blob NOT NULL,
+    PRIMARY KEY (TextureId)
   );", &[]).unwrap(); 
    conn.execute("
 CREATE TABLE MeshVertex 
@@ -312,40 +340,41 @@ CREATE TABLE MeshVertex
 ", &[]).unwrap(); 
 }
 
-fn insert_object(tx: &rusqlite::Transaction, object_id: i32, name: &str, file: &str) -> Result<i32, rusqlite::Error> {
+fn insert_object(tx: &rusqlite::Transaction, object_id: i32, name: &str, texture_id: i32) -> Result<i32, rusqlite::Error> {
    let mut stmt = tx.prepare("
 INSERT INTO Object 
-  (ObjectId, Name, ColladaFile) 
+  (ObjectId, Name, TextureId) 
 VALUES 
   ($1, $2, $3);
 ").unwrap();
-   stmt.execute(&[&object_id, &name, &file])
+   stmt.execute(&[&object_id, &name, &texture_id])
 }
+fn insert_texture(tx: &rusqlite::Transaction, texture_id: i32, name: &str, img: Image) -> Result<i32, rusqlite::Error> {
+   let mut stmt = tx.prepare("
+INSERT INTO Texture
+  ( TextureId  
+  , Name     
+  , Width
+  , Height
+  , Data  
+  )
+VALUES 
+  ($1, $2, $3, $4, $5);
+").unwrap();
+   stmt.execute(&[&texture_id, &name, &(img.width as i32), &(img.height as i32), &img.data])
+}
+
 fn insert_mesh(tx: &rusqlite::Transaction, object_id: i32, mesh_id: i32, name: &str) -> Result<i32, rusqlite::Error> {
    let mut stmt = tx.prepare("
 INSERT INTO Mesh 
   ( ObjectId
   , MeshId  
   , Name    
-  , Texture 
-  , DiffuseR
-  , DiffuseG
-  , DiffuseB
-  , DiffuseA
   )
 VALUES 
-  ($1, $2, $3, $4, $5, $6, $7, $8);
+  ($1, $2, $3);
 ").unwrap();
-    let color = match name {
-        "eye-mesh" => [0.0,0.0,0.0],
-        "mayu-mesh" => [0.1149353,0.03830004,0.004554826],
-        "hair_h-mesh" => [0.1149353,0.03830004,0.004554826],
-        "hair-mesh" => [0.1149353,0.03830004,0.004554826],
-        "body-mesh" => [0.8,0.525,0.23],
-        _ => {println!("{}", name); [0.5; 3]}
-    };
-
-   stmt.execute(&[&object_id, &mesh_id, &name, &"", &color[0], &color[1], &color[2], &1])
+   stmt.execute(&[&object_id, &mesh_id, &name])
 }
 
 fn insert_vertex(tx: &rusqlite::Transaction, object_id: i32, mesh_id: i32, v: &Vertex, inx: i32) -> Result<i32, rusqlite::Error> {
@@ -394,10 +423,6 @@ SELECT
 , MV.NormalZ     
 , MV.U           
 , MV.V           
-, M.DiffuseR
-, M.DiffuseG
-, M.DiffuseB
-, M.DiffuseA
 , MV.Joint1      
 , MV.Joint2      
 , MV.Joint3      
@@ -427,9 +452,6 @@ Order By MV.ObjectId, MV.MeshId, MV.IndexNo
                     , r.get::<&str,f64>("NormalZ") as f32],
             uv: [ r.get::<&str,f64>("U") as f32
                 , r.get::<&str,f64>("V") as f32],
-            color: [ r.get::<&str,f64>("DiffuseR") as f32
-                   , r.get::<&str,f64>("DiffuseG") as f32
-                   , r.get::<&str,f64>("DiffuseB") as f32],
             joint_indices: [0; 4],
             joint_weights: [0.0; 4]
         })
@@ -445,49 +467,44 @@ Order By MV.ObjectId, MV.MeshId, MV.IndexNo
    }
    meshes
 }
-pub fn open_texture<F,R>(factory: &mut F, path: &std::path::Path) -> Texture<R>
-    where R: gfx::Resources,
-          F: gfx::Factory<R>
+fn query_texture(conn: &Connection, object_id: i32) -> Image {
+   let mut stmt = conn.prepare("
+SELECT 
+  T.Width
+, T.Height
+, T.Data
+  FROM Object AS O
+LEFT JOIN Texture AS T
+  ON O.TextureId = T.TextureId
+WHERE O.ObjectId = $1
+").unwrap(); 
+   let result = stmt.query_map(&[&object_id], |r| {
+       Image {
+           data: r.get::<&str, Vec<u8>>("Data"),
+           width: r.get::<&str, i32>("Width") as u16, 
+           height: r.get::<&str, i32>("Height") as u16
+       }
+   }).unwrap();
+   result.last().unwrap().unwrap()
+}
+fn open_texture(path: &std::path::Path) -> Image
 {
-    use std::fmt;
-    use std::io::{self, Read, Write, BufRead, BufReader, BufWriter};
-    use png::{self, Reader};
+    use std::io::BufReader;
+    use png;
     let fin = std::fs::File::open(path).unwrap();
-    let mut fin = BufReader::new(fin);
+    let fin = BufReader::new(fin);
     let dec = png::Decoder::new(fin);
     let (_, mut reader) = dec.read_info().unwrap();
     // let color = reader.output_color_type().into();
     let mut data = vec![0; reader.output_buffer_size()];
     reader.next_frame(&mut data).ok();
     let (w, h) = reader.info().size(); 
-    // let image = match (color, data) {
-    //     (color::ColorType::RGBA(8), data) => {
-    //         (w
 
-    //     }
-    // };
-
-    let tex_kind = gfx::tex::Kind::D2(w as u16, h as u16,
-                                      gfx::tex::AaMode::Single);
-    let filter = gfx::tex::FilterMethod::Bilinear;
-
-    let sampler_info = gfx::tex::SamplerInfo::new(
-        filter,
-        gfx::tex::WrapMode::Clamp);
-
-
-
-    let (surface, view) = factory.create_texture_const_u8::<gfx::format::Srgba8>(
-                            tex_kind, &[&data]).unwrap();
-    let sampler = factory.create_sampler(sampler_info);
-
-    Texture { surface: surface, sampler: sampler, view: view }
-}
-
-pub struct Texture<R> where R: gfx::Resources {
-    pub surface: gfx::handle::Texture<R, gfx::format::R8_G8_B8_A8>,
-    pub sampler: gfx::handle::Sampler<R>,
-    pub view: gfx::handle::ShaderResourceView<R, [f32; 4]>
+    Image {
+        data: data,
+        width: w as u16,
+        height: h as u16
+    }
 }
 
 
