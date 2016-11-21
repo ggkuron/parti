@@ -1,7 +1,7 @@
 #[macro_use]
 extern crate gfx;
-extern crate gfx_window_glutin;
 extern crate glutin;
+extern crate gfx_window_glutin;
 extern crate collada;
 extern crate cgmath;
 extern crate rusqlite;
@@ -13,7 +13,6 @@ use rusqlite::Connection;
 
 pub type ColorFormat = gfx::format::Rgba8;
 pub type DepthFormat = gfx::format::DepthStencil;
-use rusqlite::types::ToSql;
 
 use cgmath:: {
     EuclideanSpace,
@@ -22,7 +21,7 @@ use cgmath:: {
     Matrix4,
     One,
     Zero,
-    // Rotation,
+    Rotation,
     // Quaternion,
 };
 
@@ -31,10 +30,10 @@ pub fn main() {
     use gfx::Device;
     use gfx::Factory;
 
-    let mut conn = Connection::open(&Path::new("test.sqlite")).unwrap();
-    // let mut conn = Connection::open_in_memory().unwrap();
-    create_table(&conn);
-    register_collada(&mut conn, 1, "assets/human31.dae", 1, "assets/h.png",).unwrap();
+    let mut conn = Connection::open(&Path::new("test.sqlite")).expect("failed to open sqlite file");
+     // let mut conn = Connection::open_in_memory().unwrap();
+     // create_table(&conn);
+    // register_collada(&mut conn, 2, "assets/tree.dae", 2, "assets/tree.png",).expect("failed to register");
 
     let width = 1024;
     let height = 768;
@@ -49,23 +48,21 @@ pub fn main() {
         include_bytes!("shader/150.glslv"),
         include_bytes!("shader/150.glslf"),
         pipe::new()
-    ).unwrap();
+    ).expect("failed to create pipeline");
 
     let sampler_info = gfx::tex::SamplerInfo::new(
         gfx::tex::FilterMethod::Trilinear,
         gfx::tex::WrapMode::Clamp);
     let sampler = factory.create_sampler(sampler_info);
 
-    let mut entries = Vec::new();
-
-    let result = query_mesh(&conn, 1);
-    let img = query_texture(&conn, 1);
+    let result = query_mesh(&conn, 2);
+    let img = query_texture(&conn, 2);
     let tex_kind = gfx::tex::Kind::D2(img.width, img.height,
                                       gfx::tex::AaMode::Single);
     let (_, view) = factory.create_texture_const_u8::<gfx::format::Srgba8>(
-                            tex_kind, &[&img.data]).unwrap();
+                            tex_kind, &[&img.data]).expect("create texture failure");
 
-
+    let mut entries = Vec::new();
     for vertex_data in result
     {
         let index_data: Vec<u32> = vertex_data.iter().enumerate().map(|(i, _)| i as u32).collect();
@@ -73,7 +70,9 @@ pub fn main() {
 
         entries.push(Entry {
             slice: slice,
-            vertex_buffer: vbuf
+            vertex_buffer: vbuf,
+            position: Vector3::zero(),
+            front: Vector3::new(0.0, -1.0, 0.0)
         });
     }
     let mut camera = Camera::new(Point3::new(0.0, -7.0, 0.0),
@@ -86,12 +85,17 @@ pub fn main() {
                                  });
 
     let mut encoder: gfx::Encoder<_, _> = factory.create_command_buffer().into();
+    // let r0 = Rotation::between_vectors(Vector3::new(0.0, -1.0, 0.0), Vector3::new(1.0, 0.0, 0.0));
 
     'main: loop {
         for event in window.poll_events() {
             match event_handler(event) {
                 GameCommand::Exit => break 'main,
-                GameCommand::CameraMove(v) => camera.translate(v),
+                GameCommand::CameraMove(v) => { camera.translate(v); camera.update() },
+                GameCommand::AvatorMoveW => { entries[0].position += Vector3::new(0.0, 1.0, 0.0); },
+                GameCommand::AvatorMoveS => { entries[0].position -= Vector3::new(1.0, 0.0, 0.0); },
+                GameCommand::AvatorMoveA => { entries[0].position += Vector3::new(1.0, 0.0, 0.0); },
+                GameCommand::AvatorMoveD => { entries[0].position -= Vector3::new(1.0, 1.0, 0.0); },
                 _ => {}
             }
         }
@@ -108,19 +112,24 @@ pub fn main() {
                 u_ambient_color: [0.01, 0.01, 0.01, 1.0],
                 u_eye_direction: camera.direction().into(),
                 u_texture: (view.clone(), sampler.clone()),
+                u_translate: Matrix4::from_translation(entry.position).into(),
                 out: main_color.clone(),
                 out_depth: main_depth.clone()
             };
             encoder.draw(&entry.slice, &pso, &data);
         }
         encoder.flush(&mut device);
-        window.swap_buffers().unwrap();
+        window.swap_buffers();
         device.cleanup();
     }
 }
 
 enum GameCommand {
     CameraMove (Vector3<f32>),
+    AvatorMoveW,
+    AvatorMoveS,
+    AvatorMoveA,
+    AvatorMoveD,
     Exit,
     NOP
 }
@@ -137,11 +146,19 @@ fn event_handler(ev :glutin::Event) -> GameCommand {
             => GameCommand::CameraMove(Vector3::new(0.0,0.0,-0.5)),
         glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::K)) 
             => GameCommand::CameraMove(Vector3::new(0.0,0.0,0.5)),
+        glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::W)) 
+            => GameCommand::AvatorMoveW,
+        glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::S)) 
+            => GameCommand::AvatorMoveS,
+        glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::A)) 
+            => GameCommand::AvatorMoveA,
+        glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::D)) 
+            => GameCommand::AvatorMoveD,
         glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::Z)) 
             => GameCommand::CameraMove(Vector3::new(0.0,0.5,0.0)),
         glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::X)) 
             => GameCommand::CameraMove(Vector3::new(0.0,-0.5,0.0)),
-        _ => GameCommand::NOP
+        _   => { GameCommand::NOP}
     }
 }
 
@@ -167,6 +184,7 @@ gfx_defines!{
         u_ambient_color: gfx::Global<[f32; 4]> = "u_ambientColor",
         u_eye_direction: gfx::Global<[f32; 3]> = "u_eyeDirection",
         u_texture: gfx::TextureSampler<[f32; 4]> = "u_texture",
+        u_translate: gfx::Global<[[f32; 4]; 4]> = "u_translate",
         out: gfx::RenderTarget<ColorFormat> = "Target0",
         out_depth: gfx::DepthTarget<gfx::format::DepthStencil> = gfx::preset::depth::LESS_EQUAL_WRITE,
     }
@@ -197,13 +215,18 @@ impl<T: cgmath::BaseFloat> Camera<T> {
     }
     fn translate(&mut self, v: Vector3<T>) {
         self.pos += v;
+    }
+    fn lookTo(&mut self, target: Point3<T>) {
+        self.target = target;
+    }
+    fn direction(& self) -> Vector3<T> {
+        self.target - self.pos
+    }
+    fn update(&mut self) {
         self.view = Matrix4::look_at(self.pos
                                     ,self.target
                                     ,Vector3::new(Zero::zero(), Zero::zero(), One::one()));
         self.projection = self.perspective * self.view;
-    }
-    fn direction(& self) -> Vector3<T> {
-        self.target - self.pos
     }
 }
 
@@ -221,9 +244,12 @@ impl Default for Vertex {
 
 const CLEAR_COLOR: [f32; 4] = [0.1, 0.2, 0.3, 1.0];
 
+
 pub struct Entry<R: gfx::Resources> {
     slice: gfx::Slice<R>,
-    vertex_buffer: gfx::handle::Buffer<R, Vertex>
+    vertex_buffer: gfx::handle::Buffer<R, Vertex>,
+    position: Vector3<f32>,
+    front: Vector3<f32>,
 }
 
 fn vtn_to_vertex(a: collada::VTNIndex, obj: &collada::Object) -> Vertex {
@@ -254,14 +280,14 @@ fn vtn_to_vertex(a: collada::VTNIndex, obj: &collada::Object) -> Vertex {
 }
 
 fn register_collada(conn: &mut Connection, object_id: i32, collada_name: &str, texture_id: i32, texture_name: &str) -> rusqlite::Result<()> {
-    let tx = try!(conn.transaction());
+    let tx = conn.transaction()?;
 
     let img = open_texture(&std::path::Path::new(texture_name));
-    let collada_doc = ColladaDocument::from_path(&Path::new(collada_name)).unwrap();
-    let collada_objs = collada_doc.get_obj_set().unwrap();
+    let collada_doc = ColladaDocument::from_path(&Path::new(collada_name)).expect("failed to load dae");
+    let collada_objs = collada_doc.get_obj_set().expect("cannot read obj set");
 
-    insert_object(&tx, object_id, &collada_name, texture_id).unwrap();
-    insert_texture(&tx, texture_id, &texture_name, img).unwrap();
+    insert_object(&tx, object_id, &collada_name, texture_id).expect("failed to insert sqlite (Object)");
+    insert_texture(&tx, texture_id, &texture_name, img).expect("failed to insert sqlite (Texture)");
 
     for (i, obj) in collada_objs.objects.iter().enumerate() {
         register_collada_object(&tx, &obj, object_id, i as i32 + 1)
@@ -271,7 +297,7 @@ fn register_collada(conn: &mut Connection, object_id: i32, collada_name: &str, t
 
 fn register_collada_object(tx: &rusqlite::Transaction, obj: &collada::Object, object_id: i32, mesh_id: i32) {
     let mut i = 0;
-    insert_mesh(&tx, object_id, mesh_id, &obj.name).unwrap();
+    insert_mesh(&tx, object_id, mesh_id, &obj.name).expect("failed to insert sqlite (Mesh)");
     for geom in obj.geometry.iter() {
        let mut add = |a: collada::VTNIndex| {
            i += 1;
@@ -297,14 +323,14 @@ CREATE TABLE Object
     Name        TEXT NOT NULL,
     TextureId   INTEGER NOT NULL
   );
-", &[]).unwrap(); 
+", &[]).expect("create failure1"); 
    conn.execute("
 CREATE TABLE Mesh 
   ( ObjectId  INTEGER NOT NULL,
     MeshId    INTEGER NOT NULL,
     Name      TEXT NOT NULL,
     PRIMARY KEY (ObjectId, MeshId)
-  );", &[]).unwrap(); 
+  );", &[]).expect("create failure2"); 
    conn.execute("
 CREATE TABLE Texture
   ( TextureId  INTEGER NOT NULL,
@@ -313,7 +339,7 @@ CREATE TABLE Texture
     Height    INTEGER NOT NULL,
     Data   Blob NOT NULL,
     PRIMARY KEY (TextureId)
-  );", &[]).unwrap(); 
+  );", &[]).expect("create failure3"); 
    conn.execute("
 CREATE TABLE MeshVertex 
   ( ObjectId      INTEGER NOT NULL,
@@ -337,7 +363,7 @@ CREATE TABLE MeshVertex
     JointWeight4  REAL NOT NULL,
     PRIMARY KEY (ObjectId, MeshId, IndexNo)
   );
-", &[]).unwrap(); 
+", &[]).expect("create failure4"); 
 }
 
 fn insert_object(tx: &rusqlite::Transaction, object_id: i32, name: &str, texture_id: i32) -> Result<i32, rusqlite::Error> {
@@ -346,7 +372,7 @@ INSERT INTO Object
   (ObjectId, Name, TextureId) 
 VALUES 
   ($1, $2, $3);
-").unwrap();
+").expect("failed to insert Object");
    stmt.execute(&[&object_id, &name, &texture_id])
 }
 fn insert_texture(tx: &rusqlite::Transaction, texture_id: i32, name: &str, img: Image) -> Result<i32, rusqlite::Error> {
@@ -360,7 +386,7 @@ INSERT INTO Texture
   )
 VALUES 
   ($1, $2, $3, $4, $5);
-").unwrap();
+").expect("failed to insert Texture");
    stmt.execute(&[&texture_id, &name, &(img.width as i32), &(img.height as i32), &img.data])
 }
 
@@ -373,7 +399,7 @@ INSERT INTO Mesh
   )
 VALUES 
   ($1, $2, $3);
-").unwrap();
+").expect("failed to insert Mesh");
    stmt.execute(&[&object_id, &mesh_id, &name])
 }
 
@@ -402,11 +428,11 @@ INSERT INTO MeshVertex
     JointWeight4 )
 VALUES
   ($1 ,$2 ,$3 ,$4 ,$5 ,$6 ,$7 ,$8 ,$9 ,$10 ,$11 ,$12 ,$13 ,$14 ,$15 ,$16 ,$17 ,$18 ,$19)
-").unwrap();
+").expect("failed to insert MeshVertex");
    stmt.execute(&[&object_id, &mesh_id, &inx,
-                  &(v.pos[0] as f64) as &ToSql, &(v.pos[1] as f64) as &ToSql, &(v.pos[2] as f64) as &ToSql,
-                  &(v.normal[0] as f64) as &ToSql, &(v.normal[1] as f64) as &ToSql, &(v.normal[2] as f64) as &ToSql,
-                  &(v.uv[0] as f64) as &ToSql, &(v.uv[1] as f64) as &ToSql,
+                  &(v.pos[0] as f64), &(v.pos[1] as f64), &(v.pos[2] as f64),
+                  &(v.normal[0] as f64), &(v.normal[1] as f64), &(v.normal[2] as f64),
+                  &(v.uv[0] as f64), &(v.uv[1] as f64),
                   &0,&0,&0,&0,
                   &0,&0,&0,&0])
 }
@@ -439,7 +465,7 @@ LEFT JOIN MeshVertex AS MV
   and M.MeshId = MV.MeshId
 WHERE O.ObjectId = $1
 Order By MV.ObjectId, MV.MeshId, MV.IndexNo
-").unwrap(); 
+").expect("sql failure:"); 
    let mut meshes = Vec::new();
    let result = stmt.query_map(&[&object_id], |r| {
        ( r.get::<&str,i32>("MeshId") as usize
@@ -455,10 +481,10 @@ Order By MV.ObjectId, MV.MeshId, MV.IndexNo
             joint_indices: [0; 4],
             joint_weights: [0.0; 4]
         })
-   }).unwrap();
+   }).expect("query failure");
    for r in result 
    {
-       let (mesh_id, v) = r.unwrap();
+       let (mesh_id, v) = r.expect("wrap failure");
        if meshes.len() < mesh_id 
        { 
            meshes.push(Vec::new());
@@ -477,24 +503,24 @@ SELECT
 LEFT JOIN Texture AS T
   ON O.TextureId = T.TextureId
 WHERE O.ObjectId = $1
-").unwrap(); 
+").expect("select failure"); 
    let result = stmt.query_map(&[&object_id], |r| {
        Image {
            data: r.get::<&str, Vec<u8>>("Data"),
            width: r.get::<&str, i32>("Width") as u16, 
            height: r.get::<&str, i32>("Height") as u16
        }
-   }).unwrap();
-   result.last().unwrap().unwrap()
+   }).expect("select failure");
+   result.last().expect("select1").expect("select2")
 }
 fn open_texture(path: &std::path::Path) -> Image
 {
     use std::io::BufReader;
     use png;
-    let fin = std::fs::File::open(path).unwrap();
+    let fin = std::fs::File::open(path).expect("no such file");
     let fin = BufReader::new(fin);
     let dec = png::Decoder::new(fin);
-    let (_, mut reader) = dec.read_info().unwrap();
+    let (_, mut reader) = dec.read_info().expect("collada load failure");
     // let color = reader.output_color_type().into();
     let mut data = vec![0; reader.output_buffer_size()];
     reader.next_frame(&mut data).ok();
@@ -506,5 +532,4 @@ fn open_texture(path: &std::path::Path) -> Image
         height: h as u16
     }
 }
-
 
