@@ -50,16 +50,16 @@ pub fn main() {
         pipe::new()
     ).expect("failed to create pipeline");
 
-    let sampler_info = gfx::tex::SamplerInfo::new(
-        gfx::tex::FilterMethod::Trilinear,
-        gfx::tex::WrapMode::Clamp);
+    let sampler_info = gfx::texture::SamplerInfo::new(
+        gfx::texture::FilterMethod::Trilinear,
+        gfx::texture::WrapMode::Clamp);
     let sampler = factory.create_sampler(sampler_info);
 
-    let result = query_mesh(&conn, 2);
-    let img = query_texture(&conn, 2);
-    let tex_kind = gfx::tex::Kind::D2(img.width, img.height,
-                                      gfx::tex::AaMode::Single);
-    let (_, view) = factory.create_texture_const_u8::<gfx::format::Srgba8>(
+    let result = query_mesh(&conn, 1);
+    let img = query_texture(&conn, 1);
+    let tex_kind = gfx::texture::Kind::D2(img.width, img.height,
+                                      gfx::texture::AaMode::Single);
+    let (_, view) = factory.create_texture_immutable_u8::<gfx::format::Srgba8>(
                             tex_kind, &[&img.data]).expect("create texture failure");
 
     let mut entries = Vec::new();
