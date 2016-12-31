@@ -8,7 +8,6 @@ in vec3 position, normal;
 in vec2 uv;
 
 out vec2 v_TexCoord;
-
 out vec3 _normal;
 
 void main() {
