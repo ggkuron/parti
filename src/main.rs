@@ -4,9 +4,11 @@ extern crate glutin;
 extern crate gfx_window_glutin;
 extern crate cgmath;
 extern crate rusqlite;
+extern crate fnv;
 
 use rusqlite::Connection;
 use std::path::Path;
+use fnv::FnvHashMap;
 
 pub type ColorFormat = gfx::format::Rgba8;
 pub type DepthFormat = gfx::format::DepthStencil;
@@ -49,32 +51,10 @@ pub fn main() {
         gfx::texture::WrapMode::Clamp);
     let sampler = factory.create_sampler(sampler_info);
 
-    let result = query_mesh(&conn, 1);
-    let mut entries = Vec::new();
-    for r in result
-    {
-        let vertex_data = r.0;
-        let texture_id = r.1;
+    let mut entries = query_entry(&conn, &mut factory, &[3, 2]);
 
-        let index_data: Vec<u32> = vertex_data.iter().enumerate().map(|(i, _)| i as u32).collect();
-        let (vbuf, slice) = factory.create_vertex_buffer_with_slice(&vertex_data, &index_data[..]);
-
-        let img = query_texture(&conn, texture_id);
-        let tex_kind = gfx::texture::Kind::D2(img.width, img.height,
-                                          gfx::texture::AaMode::Single);
-        let (_, view) = factory.create_texture_immutable_u8::<gfx::format::Srgba8>(
-                                tex_kind, &[&img.data]).expect("create texture failure");
-
-        entries.push(Entry {
-            slice: slice,
-            vertex_buffer: vbuf,
-            position: Vector3::zero(),
-            front: Vector3::new(0.0, -1.0, 0.0),
-            texture: view
-        });
-    }
-    let mut camera = Camera::new(Point3::new(0.0, -7.0, 0.0),
-                                 Point3::origin(),
+    let mut camera = Camera::new(Point3::new(30.0, -40.0, 30.0),
+                                 Point3::new(0.0, 0.0, 0.0),
                                  cgmath::PerspectiveFov  {
                                      fovy: cgmath::Rad(16.0f32.to_radians()),
                                      aspect: (width as f32) / (height as f32),
@@ -90,10 +70,10 @@ pub fn main() {
             match event_handler(event) {
                 GameCommand::Exit => break 'main,
                 GameCommand::CameraMove(v) => { camera.translate(v); camera.update() },
-                GameCommand::AvatorMoveW => { entries[0].position += Vector3::new(0.0, 1.0, 0.0); },
-                GameCommand::AvatorMoveS => { entries[0].position -= Vector3::new(1.0, 0.0, 0.0); },
-                GameCommand::AvatorMoveA => { entries[0].position += Vector3::new(1.0, 0.0, 0.0); },
-                GameCommand::AvatorMoveD => { entries[0].position -= Vector3::new(1.0, 1.0, 0.0); },
+                GameCommand::AvatorMoveW => { entries.get_mut(&2).unwrap().translate(Vector3::new(0.0, 1.0, 0.0)); },
+                GameCommand::AvatorMoveS => { entries.get_mut(&2).unwrap().translate(Vector3::new(- 1.0, 0.0, 0.0)); },
+                GameCommand::AvatorMoveA => { entries.get_mut(&2).unwrap().translate(Vector3::new(1.0, 0.0, 0.0)); },
+                GameCommand::AvatorMoveD => { entries.get_mut(&2).unwrap().translate(Vector3::new(- 1.0, - 1.0, 0.0)); },
                 _ => {}
             }
         }
@@ -101,20 +81,22 @@ pub fn main() {
         encoder.clear(&main_color.clone(), CLEAR_COLOR);
         encoder.clear_depth(&main_depth, 1.0);
 
-        for entry in entries.iter_mut() {
-            let data = pipe::Data {
-                vbuf: entry.vertex_buffer.clone(),
-                u_model_view_proj: camera.projection.into(),
-                u_model_view: camera.view.into(),
-                u_light: [1.0, 0.5, -0.5f32],
-                u_ambient_color: [0.01, 0.01, 0.01, 1.0],
-                u_eye_direction: camera.direction().into(),
-                u_texture: (entry.texture.clone(), sampler.clone()),
-                u_translate: Matrix4::from_translation(entry.position).into(),
-                out: main_color.clone(),
-                out_depth: main_depth.clone()
-            };
-            encoder.draw(&entry.slice, &pso, &data);
+        for obj in entries.values() {
+            for entry in &obj.entries {
+                let data = pipe::Data {
+                    vbuf: entry.vertex_buffer.clone(),
+                    u_model_view_proj: camera.projection.into(),
+                    u_model_view: camera.view.into(),
+                    u_light: [1.0, 0.5, -0.5f32],
+                    u_ambient_color: [0.01, 0.01, 0.01, 1.0],
+                    u_eye_direction: camera.direction().into(),
+                    u_texture: (entry.texture.clone(), sampler.clone()),
+                    u_translate: Matrix4::from_translation(obj.position).into(),
+                    out: main_color.clone(),
+                    out_depth: main_depth.clone()
+                };
+                encoder.draw(&entry.slice, &pso, &data);
+            }
         }
         encoder.flush(&mut device);
         window.swap_buffers();
@@ -211,9 +193,6 @@ impl<T: cgmath::BaseFloat> Camera<T> {
             projection: pers * view
         }
     }
-    fn translate(&mut self, v: Vector3<T>) {
-        self.pos += v;
-    }
     fn look_to(&mut self, target: Point3<T>) {
         self.target = target;
     }
@@ -245,13 +224,71 @@ const CLEAR_COLOR: [f32; 4] = [0.1, 0.2, 0.3, 1.0];
 pub struct Entry<R: gfx::Resources> {
     slice: gfx::Slice<R>,
     vertex_buffer: gfx::handle::Buffer<R, Vertex>,
-    position: Vector3<f32>,
-    front: Vector3<f32>,
     texture: gfx::handle::ShaderResourceView<R, [f32; 4]>
 }
 
+fn query_entry<R: gfx::Resources, F: gfx::Factory<R>>(conn: &Connection, factory: &mut F, ids: &[i32]) -> FnvHashMap<i32, Object<R>> {
+    use gfx::traits::FactoryExt;
 
-fn query_mesh(conn: &Connection, object_id: i32) -> Vec<(Vec<Vertex>, i32)> {
+    let mut result = FnvHashMap::default();
+
+    for id in ids {
+        let mut entries = Vec::new();
+        let meshes = query_mesh(&conn, id);
+        for r in meshes
+        {
+            let vertex_data = r.0;
+            let texture_id = r.1;
+
+            let index_data: Vec<u32> = vertex_data.iter().enumerate().map(|(i, _)| i as u32).collect();
+            let (vbuf, slice) = factory.create_vertex_buffer_with_slice(&vertex_data, &index_data[..]);
+
+            let img = query_texture(&conn, texture_id);
+            let tex_kind = gfx::texture::Kind::D2(img.width, img.height,
+                                              gfx::texture::AaMode::Single);
+            let (_, view) = factory.create_texture_immutable_u8::<gfx::format::Srgba8>(
+                                    tex_kind, &[&img.data]).expect("create texture failure");
+            entries.push(
+                Entry {
+                    slice: slice,
+                    vertex_buffer: vbuf,
+                    texture: view
+                }
+            );
+        }
+        result.insert(id.clone(), 
+                      Object {
+                          entries: entries,
+                          position: Vector3::zero(),
+                          // front: Vector3::new(0.0, -1.0, 0.0)
+                      });
+    }
+    result
+}
+
+struct Object<R: gfx::Resources> {
+    entries: Vec<Entry<R>>,
+    position: Vector3<f32>,
+    // front: Vector3<f32>,
+}
+
+trait Translate<T: cgmath::BaseFloat> {
+    fn translate(&mut self, v: Vector3<T>);
+}
+
+impl<R: gfx::Resources> Translate<f32> for Object<R>{
+    fn translate(&mut self, v: Vector3<f32>) {
+        self.position += v;
+    }
+}
+impl<T: cgmath::BaseFloat> Translate<T> for Camera<T> {
+    fn translate(&mut self, v: Vector3<T>) {
+        self.pos += v;
+    }
+}
+
+
+fn query_mesh(conn: &Connection, object_id: &i32) -> Vec<(Vec<Vertex>, i32)> {
    let mut stmt = conn.prepare("
 SELECT 
   M.MeshId
@@ -282,7 +319,7 @@ WHERE O.ObjectId = ?1
 Order By MV.ObjectId, MV.MeshId, MV.IndexNo
 ").expect("sql failure:"); 
    let mut meshes = Vec::new();
-   let result = stmt.query_map(&[&object_id], |r| {
+   let result = stmt.query_map(&[object_id], |r| {
        ( r.get::<&str,i32>("MeshId") as usize
        , r.get::<&str,i32>("TextureId")
        , Vertex { 
