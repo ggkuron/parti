@@ -9,6 +9,8 @@ glutin = "0.7"
 cgmath = "0.12.0"
 rusqlite = "0.7.3"
 fnv = "1.0.3"
+coarsetime = "0.1"
+freetype-rs = "0.11"
 [dependencies.gfx]
 git = "https://github.com/gfx-rs/gfx.git"
 rev = "a33a640cbf048ad0348a73b5b47c61437a739a53"
