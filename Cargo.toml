@@ -13,10 +13,10 @@ coarsetime = "0.1"
 freetype-rs = "0.11"
 [dependencies.gfx]
 git = "https://github.com/gfx-rs/gfx.git"
-rev = "a33a640cbf048ad0348a73b5b47c61437a739a53"
+rev = "784247d73688402157bbfb8672bcccf07aa10360"
 [dependencies.gfx_window_glutin]
 git = "https://github.com/gfx-rs/gfx.git"
-rev = "a33a640cbf048ad0348a73b5b47c61437a739a53"
+rev = "784247d73688402157bbfb8672bcccf07aa10360"
 [dependencies.gfx_device_gl]
 git = "https://github.com/gfx-rs/gfx.git"
-rev = "a33a640cbf048ad0348a73b5b47c61437a739a53"
+rev = "784247d73688402157bbfb8672bcccf07aa10360"

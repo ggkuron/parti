@@ -20,6 +20,8 @@ use freetype as ft;
 use freetype::Error as FreetypeError;
 use freetype::Face;
 
+use gfx::memory::Typed;
+
 pub type ColorFormat = gfx::format::Srgba8;
 pub type DepthFormat = gfx::format::Depth;
 
@@ -32,6 +34,7 @@ use cgmath:: {
     Zero,
     // Rotation,
     // Quaternion,
+    Transform,
 };
 type FontResult = Result<Font, FontError>;
 type RusqliteResult<T> = Result<T, RusqliteError>;
@@ -87,18 +90,18 @@ pub fn main() {
             gfx::Primitive::TriangleList,
             gfx::state::Rasterizer::new_fill(),
             pipe_w::new()
-            ).expect("failed to create pipeline")
+            ).expect("failed to create pipeline w")
     };
-    let pso_w2 = {
-        let shaders = factory.create_shader_set(include_bytes!("shader/150.glslv"),
-        include_bytes!("shader/150.glslf")).expect("shader exists?");
-        factory.create_pipeline_state(
-            &shaders,
-            gfx::Primitive::TriangleList,
-            gfx::state::Rasterizer::new_fill(),
-            pipe_w2::new()
-            ).expect("failed to create pipeline")
-    };
+    // let pso_w2 = {
+    //     let shaders = factory.create_shader_set(include_bytes!("shader/150.glslv"),
+    //     include_bytes!("shader/150.glslf")).expect("shader exists?");
+    //     factory.create_pipeline_state(
+    //         &shaders,
+    //         gfx::Primitive::TriangleList,
+    //         gfx::state::Rasterizer::new_fill(),
+    //         pipe_w2::new()
+    //         ).expect("failed to create pipeline w2")
+    // };
     let pso_p = {
         let shaders = factory.create_shader_set(b"
 #version 150 core
@@ -137,7 +140,7 @@ void main() {
     };
     
     let mut encoder: gfx::Encoder<_, _> = factory.create_command_buffer().into();
-    let mut entries = query_entry(&conn, &mut factory, &[4, 2]).unwrap();
+    let mut entries = query_entry(&conn, &mut factory, &[1]).unwrap();
     let mut camera = Camera::new(Point3::new(30.0, -40.0, 30.0),
     Point3::new(0.0, 0.0, 0.0),
     cgmath::PerspectiveFov {
@@ -147,12 +150,12 @@ void main() {
         far: 1000.0,
     });
     
-    let font_entry = font_entry(&mut factory, "雑に文字描画");
+    let font_entry = font_entry(&mut factory, "に");
     
     'main: loop {
         let timer = coarsetime::Instant::now();
         {
-            let mut avator = entries.get_mut(&4).unwrap();
+            let mut avator = entries.get_mut(&1).unwrap();
             for event in window.poll_events() {
                 match event_handler(event) {
                     Some(GameCommand::Exit) => break 'main,
@@ -171,17 +174,20 @@ void main() {
         for obj in entries.values() {
             let mv = camera.view * Matrix4::from_translation(obj.position.to_vec());
             let mvp = camera.perspective * mv;
+            let skinning_buffer = factory.create_constant_buffer::<Skinning>(64);
+            encoder.update_buffer(&skinning_buffer, &obj.skinning[..], 0).unwrap();
             for entry in &obj.entries {
                 let data = pipe_w::Data {
                     vbuf: entry.vertex_buffer.clone(),
                     u_model_view_proj: mvp.into(),
                     u_model_view: mv.into(),
-                    u_light: [1.0, 0.5, -0.5f32],
+                    u_light: [0.2, 0.2, -0.2f32],
                     u_ambient_color: [0.01, 0.01, 0.01, 1.0],
                     u_eye_direction: camera.direction().into(),
                     u_texture: (entry.texture.clone(), sampler.clone()),
                     out_color: main_color.clone(),
-                    out_depth: main_depth.clone()
+                    out_depth: main_depth.clone(),
+                    b_skinning: skinning_buffer.raw().clone(),
                 };
                 encoder.draw(&entry.slice, &pso, &data);
             }
@@ -207,20 +213,20 @@ void main() {
             };
             encoder.draw(&slice, &pso_p, &data);
         }
-        {
-            let data = pipe_w2::Data {
-                vbuf: font_entry.vertex_buffer.clone(),
-                u_model_view_proj: camera.projection.into(),
-                u_model_view: camera.view.into(),
-                u_light: [1.0, 0.5, -0.5f32],
-                u_ambient_color: [0.00, 0.00, 0.01, 0.4],
-                u_eye_direction: camera.direction().into(),
-                u_texture: (font_entry.texture.clone(), sampler.clone()),
-                out_color: main_color.clone(),
-                out_depth: main_depth.clone()
-            };
-            encoder.draw(&font_entry.slice, &pso_w2, &data);
-        }
+        // {
+        //     let data = pipe_w2::Data {
+        //         vbuf: font_entry.vertex_buffer.clone(),
+        //         u_model_view_proj: camera.projection.into(),
+        //         u_model_view: camera.view.into(),
+        //         u_light: [1.0, 0.5, -0.5f32],
+        //         u_ambient_color: [0.00, 0.00, 0.01, 0.4],
+        //         u_eye_direction: camera.direction().into(),
+        //         u_texture: (font_entry.texture.clone(), sampler.clone()),
+        //         out_color: main_color.clone(),
+        //         out_depth: main_depth.clone()
+        //     };
+        //     encoder.draw(&font_entry.slice, &pso_w2, &data);
+        // }
         encoder.flush(&mut device);
     
         let _ = window.swap_buffers();
@@ -282,6 +288,7 @@ gfx_defines!{
         u_texture: gfx::TextureSampler<[f32; 4]> = "u_texture",
         out_color: gfx::RenderTarget<ColorFormat> = "Target0",
         out_depth: gfx::DepthTarget<DepthFormat> = gfx::preset::depth::LESS_EQUAL_WRITE,
+        b_skinning: gfx::RawConstantBuffer = "b_skinning",
     }
     vertex Vertex {
         position: [f32; 3] = "position",
@@ -310,7 +317,9 @@ gfx_defines!{
         out_color: gfx::RenderTarget<ColorFormat> = "Target0",
         out_depth: gfx::DepthTarget<DepthFormat> = gfx::preset::depth::LESS_EQUAL_WRITE,
     }
-
+    constant Skinning {
+        transform: [[f32; 4]; 4] = "u_transform",
+    }
 }
 
 struct Camera<T> {
@@ -371,11 +380,19 @@ pub struct Entry<R: gfx::Resources, V, View> {
     texture: gfx::handle::ShaderResourceView<R, View>
 }
 
+#[derive(Debug)]
+struct Joint {
+    pub global : Matrix4<f32>,
+    bind: Matrix4<f32>,
+    inverse: Matrix4<f32>
+}
+
 fn entry<R: gfx::Resources, F: gfx::Factory<R>, V, T: gfx::format::TextureFormat>(factory: &mut F, vertex_data: &[V], img: Image<T>) -> Entry<R, V, T::View> 
 where V: gfx::traits::Pod + gfx::pso::buffer::Structure<gfx::format::Format> {
     let index_data: Vec<u32> = vertex_data.iter().enumerate().map(|(i, _)| i as u32).collect();
     entry_(factory, &vertex_data, &index_data[..], img)
 }
+
 
 fn entry_<R: gfx::Resources, F: gfx::Factory<R>, V, T: gfx::format::TextureFormat>(factory: &mut F, vertex_data: &[V], index_data: &[u32], img: Image<T>) -> Entry<R, V, T::View> 
 where V: gfx::traits::Pod + gfx::pso::buffer::Structure<gfx::format::Format> {
@@ -469,6 +486,7 @@ fn query_entry<R: gfx::Resources, F: gfx::Factory<R>>(conn: &Connection, factory
     for id in ids {
         let mut entries = Vec::new();
         let meshes = query_mesh(&conn, id)?;
+        let joints = query_skeleton(&conn, id)?;
         for r in meshes
         {
             let vertex_data = r.0;
@@ -485,6 +503,9 @@ fn query_entry<R: gfx::Resources, F: gfx::Factory<R>>(conn: &Connection, factory
                           entries: entries,
                           position: Point3::new(0.0, 0.0, 0.0),
                           // front: Vector3::new(0.0, -1.0, 0.0)
+                          skinning: joints.iter().map(|(i, j)| {
+                                                      Skinning{ transform: j.global.into()}
+                          }).collect()
                       });
     }
     Ok(result)
@@ -494,6 +515,7 @@ struct Object<R: gfx::Resources, V> {
     entries: Vec<Entry<R, V, [f32;4]>>,
     position: Point3<f32>,
     // front: Vector3<f32>,
+    skinning: Vec<Skinning>
 }
 
 trait Translate<T: cgmath::BaseFloat> {
@@ -542,32 +564,29 @@ LEFT JOIN MeshVertex AS MV
 WHERE O.ObjectId = ?1
 Order By MV.ObjectId, MV.MeshId, MV.IndexNo
 ")?;
-
-    let result = stmt.query_map(&[object_id], |r| 
-                                {
-                                    ( r.get::<&str,i32>("MeshId") as usize,
-                                      r.get::<&str,i32>("TextureId"),
-                                      Vertex { 
-                                          position: [ r.get::<&str,f64>("PositionX") as f32,
-                                                      r.get::<&str,f64>("PositionY") as f32,
-                                                      r.get::<&str,f64>("PositionZ") as f32],
-                                          normal: [ r.get::<&str,f64>("NormalX") as f32,
-                                                    r.get::<&str,f64>("NormalY") as f32,
-                                                    r.get::<&str,f64>("NormalZ") as f32],
-                                          uv: [ r.get::<&str,f64>("U") as f32,
-                                                1.0 - r.get::<&str,f64>("V") as f32],
-                                          joint_indices: [ r.get::<&str,i32>("Joint1"),
-                                                           r.get::<&str,i32>("Joint2"),
-                                                           r.get::<&str,i32>("Joint3"),
-                                                           r.get::<&str,i32>("Joint4")],
-                                          joint_weights: [ r.get::<&str,f64>("JointWeight1") as f32,
-                                                           r.get::<&str,f64>("JointWeight2") as f32,
-                                                           r.get::<&str,f64>("JointWeight3") as f32,
-                                                           r.get::<&str,f64>("JointWeight4") as f32]
-                                      }
-                                    )
-                                }
-    )?;
+    let result = stmt.query_map(&[object_id], |r| {
+        ( r.get::<&str,i32>("MeshId") as usize,
+          r.get::<&str,i32>("TextureId"),
+          Vertex { 
+              position: [ r.get::<&str,f64>("PositionX") as f32,
+                          r.get::<&str,f64>("PositionY") as f32,
+                          r.get::<&str,f64>("PositionZ") as f32],
+              normal: [ r.get::<&str,f64>("NormalX") as f32,
+                        r.get::<&str,f64>("NormalY") as f32,
+                        r.get::<&str,f64>("NormalZ") as f32],
+              uv: [ r.get::<&str,f64>("U") as f32,
+                    1.0 - r.get::<&str,f64>("V") as f32],
+              joint_indices: [ r.get::<&str,i32>("Joint1"),
+                               r.get::<&str,i32>("Joint2"),
+                               r.get::<&str,i32>("Joint3"),
+                               r.get::<&str,i32>("Joint4")],
+              joint_weights: [ r.get::<&str,f64>("JointWeight1") as f32,
+                               r.get::<&str,f64>("JointWeight2") as f32,
+                               r.get::<&str,f64>("JointWeight3") as f32,
+                               r.get::<&str,f64>("JointWeight4") as f32]
+          }
+        )
+    })?;
 
     let mut meshes = Vec::new();
     for r in result
@@ -599,6 +618,117 @@ WHERE T.TextureId = ?1
         }
     })
 }
+
+fn query_skeleton(conn: &Connection, object_id: &i32) -> RusqliteResult<HashMap<i32, Joint>> {
+    let mut stmt = conn.prepare("
+SELECT
+  JointIndex,
+  ParentIndex,
+  BindPose11,
+  BindPose12,
+  BindPose13,
+  BindPose14,
+  BindPose21,
+  BindPose22,
+  BindPose23,
+  BindPose24,
+  BindPose31,
+  BindPose32,
+  BindPose33,
+  BindPose34,
+  BindPose41,
+  BindPose42,
+  BindPose43,
+  BindPose44,
+  InverseBindPose11,
+  InverseBindPose12,
+  InverseBindPose13,
+  InverseBindPose14,
+  InverseBindPose21,
+  InverseBindPose22,
+  InverseBindPose23,
+  InverseBindPose24,
+  InverseBindPose31,
+  InverseBindPose32,
+  InverseBindPose33,
+  InverseBindPose34,
+  InverseBindPose41,
+  InverseBindPose42,
+  InverseBindPose43,
+  InverseBindPose44
+  FROM Joint AS J
+WHERE J.ObjectId = ?1
+ORDER BY JointIndex
+")?;
+    let result = stmt.query_map(&[object_id], |r| {
+        ( r.get::<&str,i32>("JointIndex"),
+          r.get::<&str,i32>("ParentIndex"),
+          Matrix4::new(r.get::<&str,f64>("BindPose11") as f32,
+                       r.get::<&str,f64>("BindPose12") as f32,
+                       r.get::<&str,f64>("BindPose13") as f32,
+                       r.get::<&str,f64>("BindPose14") as f32,
+                       r.get::<&str,f64>("BindPose21") as f32,
+                       r.get::<&str,f64>("BindPose22") as f32,
+                       r.get::<&str,f64>("BindPose23") as f32,
+                       r.get::<&str,f64>("BindPose24") as f32,
+                       r.get::<&str,f64>("BindPose31") as f32,
+                       r.get::<&str,f64>("BindPose32") as f32,
+                       r.get::<&str,f64>("BindPose33") as f32,
+                       r.get::<&str,f64>("BindPose34") as f32,
+                       r.get::<&str,f64>("BindPose41") as f32,
+                       r.get::<&str,f64>("BindPose42") as f32,
+                       r.get::<&str,f64>("BindPose43") as f32,
+                       r.get::<&str,f64>("BindPose44") as f32),
+          Matrix4::new(r.get::<&str,f64>("InverseBindPose11") as f32,
+                       r.get::<&str,f64>("InverseBindPose12") as f32,
+                       r.get::<&str,f64>("InverseBindPose13") as f32,
+                       r.get::<&str,f64>("InverseBindPose14") as f32,
+                       r.get::<&str,f64>("InverseBindPose21") as f32,
+                       r.get::<&str,f64>("InverseBindPose22") as f32,
+                       r.get::<&str,f64>("InverseBindPose23") as f32,
+                       r.get::<&str,f64>("InverseBindPose24") as f32,
+                       r.get::<&str,f64>("InverseBindPose31") as f32,
+                       r.get::<&str,f64>("InverseBindPose32") as f32,
+                       r.get::<&str,f64>("InverseBindPose33") as f32,
+                       r.get::<&str,f64>("InverseBindPose34") as f32,
+                       r.get::<&str,f64>("InverseBindPose41") as f32,
+                       r.get::<&str,f64>("InverseBindPose42") as f32,
+                       r.get::<&str,f64>("InverseBindPose43") as f32,
+                       r.get::<&str,f64>("InverseBindPose44") as f32)
+        )
+    })?;
+
+    let mut joints = HashMap::<i32, Joint>::default();
+    let local: Matrix4<f32> = cgmath::One::one();
+    for r in result
+    {
+        let (inx, p, bind, inverse) = r?;
+
+        local.concat(&(bind * inverse));
+
+        let m = if p != 255 {
+            joints.get(&p).unwrap().global
+        } else { 
+            cgmath::One::one()
+            // Matrix4::new(
+            //   1.0, 0.0, 0.0, 0.0,
+            //   0.0, (std::f32::consts::PI / 2.0).cos(), (std::f32::consts::PI / 2.0).sin(), 0.0,
+            //   0.0, (-std::f32::consts::PI / 2.0).sin(), (std::f32::consts::PI / 2.0).cos(), 0.0,
+            //   0.0, 0.0, 0.0, 1.0
+            // )
+        } * local;
+
+        joints.insert(inx,
+                      Joint {
+                          global: m,
+                          bind: bind,
+                          inverse : inverse,
+                      });
+    }
+    Ok(joints)
+}
+
+
 
 pub struct Font {
     width: u16,
@@ -698,7 +828,7 @@ impl Font {
         let mut cursor_x = 0;
         let mut image_height = 0;
 
-        for (ch, ch_info) in chars_info.iter_mut() {
+        for (_, ch_info) in chars_info.iter_mut() {
             if cursor_x + ch_info.width > image_width {
                 dump_row(&mut image, &chars_row);
                 chars_row.clear();
