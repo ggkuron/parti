@@ -503,9 +503,15 @@ fn query_entry<R: gfx::Resources, F: gfx::Factory<R>>(conn: &Connection, factory
                           entries: entries,
                           position: Point3::new(0.0, 0.0, 0.0),
                           // front: Vector3::new(0.0, -1.0, 0.0)
-                          skinning: joints.iter().map(|(i, j)| {
-                                                      Skinning{ transform: j.global.into()}
-                          }).collect()
+                          skinning: 
+                              if joints.len() > 0 {
+                                  joints.iter().map(|(i, j)| {
+                                                  Skinning{ transform: j.global.into()}
+                                  }).collect()
+                              } else { 
+                                  let identity: Matrix4<f32> = cgmath::One::one();
+                                  vec!({Skinning{ transform: identity.into()}})
+                              }
                       });
     }
     Ok(result)
