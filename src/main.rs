@@ -129,7 +129,7 @@ void main() {
             gfx::Primitive::LineStrip,
             gfx::state::Rasterizer::new_fill().with_cull_back(),
             pipe_p::new()
-        ).expect("failed to create pipeline")
+        ).expect("failed to create pipeline p")
     };
     
     let sampler = {
@@ -140,42 +140,72 @@ void main() {
     };
     
     let mut encoder: gfx::Encoder<_, _> = factory.create_command_buffer().into();
-    let mut entries = query_entry(&conn, &mut factory, &[1]).unwrap();
-    let mut camera = Camera::new(Point3::new(30.0, -40.0, 30.0),
-    Point3::new(0.0, 0.0, 0.0),
-    cgmath::PerspectiveFov {
-        fovy: cgmath::Rad(16.0f32.to_radians()),
-        aspect: (width as f32) / (height as f32),
-        near: 5.0,
-        far: 1000.0,
-    });
-    
+
+    let mut invoker = Invoker::<GameCommand, HashMap<i32, Object<_, _>>>::new(
+        Level::Avator, query_entry(&conn, &mut factory, &[1,2]).unwrap(),
+        Some(Box::new(
+                Invoker::<GameCommand, Camera<f32>>::new(
+                    Level::System,
+                    Camera::new(
+                        Point3::new(30.0, -40.0, 30.0),
+                        Point3::new(0.0, 0.0, 0.0),
+                        cgmath::PerspectiveFov {
+                            fovy: cgmath::Rad(16.0f32.to_radians()),
+                            aspect: (width as f32) / (height as f32),
+                            near: 5.0,
+                            far: 1000.0,
+                    }), None
+                )
+            ))
+    );
+
+    let mut camera = Camera::new(
+                    Point3::new(30.0, -40.0, 30.0),
+                    Point3::new(0.0, 0.0, 0.0),
+                    cgmath::PerspectiveFov {
+                        fovy: cgmath::Rad(16.0f32.to_radians()),
+                        aspect: (width as f32) / (height as f32),
+                        near: 5.0,
+                        far: 1000.0,
+                });
+
+    // let mut avator = entries.get_mut(&1).unwrap();
+
+
     let font_entry = font_entry(&mut factory, "に");
     
+    let timer = coarsetime::Instant::now();
+
+    // let cmd_system = ImplCor::new(Level::System, None);
+    // let cmd_avator = ImplCor::new(Level::Avator, Some(Box::new(cmd_system)));
+
     'main: loop {
-        let timer = coarsetime::Instant::now();
-        {
-            let mut avator = entries.get_mut(&1).unwrap();
-            for event in window.poll_events() {
-                match event_handler(event) {
-                    Some(GameCommand::Exit) => break 'main,
-                    Some(GameCommand::CameraMove(v)) => { camera.translate(v); },
-                    Some(GameCommand::AvatorMove(v)) => { avator.translate(v); },
-                    _ => {}
-                }
+        let elapsed = timer.elapsed().as_f64();
+        
+        // let mut command_requests_avator = CommandRequest::<_, Object<_, _>>::new(Level::Avator, Invoker::new(&mut avator));
+        // let mut command_requests_camera = CommandRequest::<_, Camera<_>>::new(Level::System, Invoker::new(&mut camera));
+        
+        for event in window.poll_events() {
+            match handle_input(event) {
+                // Some(GameCommand::Exit) => break 'main,
+                Some(gc) => { invoker.append_command(gc); },
+                _ => {}
             }
-            camera.look_to(avator.position + Vector3::new(0.0, 0.0, 10.0));
-            camera.update();
         }
-    
+        invoker.execute_all_commands();
+
+        // cmd_avator.process_request(&mut command_requests_avator);
+        // asset_manager.update_camera();
+        // let camera = &asset_manager.camera;
+
         encoder.clear(&main_color.clone(), CLEAR_COLOR);
         encoder.clear_depth(&main_depth, 1.0);
     
-        for obj in entries.values() {
+        for obj in invoker.target.values() {
             let mv = camera.view * Matrix4::from_translation(obj.position.to_vec());
             let mvp = camera.perspective * mv;
             let skinning_buffer = factory.create_constant_buffer::<Skinning>(64);
-            encoder.update_buffer(&skinning_buffer, &obj.skinning[..], 0).unwrap();
+            encoder.update_buffer(&skinning_buffer, &obj.get_skinning(elapsed)[..], 0).unwrap();
             for entry in &obj.entries {
                 let data = pipe_w::Data {
                     vbuf: entry.vertex_buffer.clone(),
@@ -232,40 +262,156 @@ void main() {
         let _ = window.swap_buffers();
         device.cleanup();
     
-        timer.elapsed().as_f64();
     }
 }
 
 enum GameCommand {
-    CameraMove (Vector3<f32>),
-    AvatorMove (Vector3<f32>),
-    Exit,
+    Move (Vector3<f32>),
+    // Exit,
 }
 
-fn event_handler(ev :glutin::Event) -> Option<GameCommand> {
+trait Request {
+    fn submit(&mut self);
+}
+
+trait Command<T> {
+    fn get_level(&self) -> Level;
+    fn execute(&self, &mut T);
+}
+
+struct Invoker<Cmd, T> {
+    commands: Vec<Cmd>,
+    target: T,
+    current_index: usize,
+
+    next: Option<Box<Request>>,
+    allowable_level: Level,
+}
+
+impl<CmdT, T> Invoker<CmdT, T> {
+    fn new(l: Level, t: T, next: Option<Box<Request>>) -> Self {
+        Invoker {
+            commands: Vec::new(),
+            target: t,
+            current_index: 0,
+
+            next: next,
+            allowable_level: l,
+        }
+    }
+    fn target(&self) -> &T {
+        &self.target
+    }
+    fn append_command(&mut self, c: CmdT) {
+        self.commands.push(c);
+    }
+}
+
+impl<CmdT, T> Invoker<CmdT, T>
+    where CmdT: Command<T> {
+    fn execute_command(&mut self) {
+        if self.commands.len() <= self.current_index {
+            return;
+        }
+        let c = &self.commands[self.current_index];
+        let t = &mut self.target;
+
+        if self.allowable_level == c.get_level() {
+            c.execute(t);
+        } else {
+            if let Some(ref mut next) = self.next {
+                next.submit();
+            }
+        }
+
+        self.current_index += 1;
+    }
+    fn execute_all_commands(&mut self) {
+        for _ in self.current_index..self.commands.len() {
+            self.execute_command();
+        }
+    }
+}
+impl<CmdT, T> Request for Invoker<CmdT, T>
+    where CmdT: Command<T> {
+    fn submit(&mut self) {
+        self.execute_command();
+    }
+}
+
+
+impl Command<Camera<f32>> for GameCommand {
+    fn get_level(&self) -> Level {
+        Level::Avator
+    }
+    fn execute(&self, c: &mut Camera<f32>) {
+        use GameCommand::Move;
+        match *self {
+            Move(v) => { c.translate(v); },
+        }
+    }
+}
+
+impl<R: gfx::Resources, V> Command<Object<R, V>> for GameCommand {
+    fn get_level(&self) -> Level {
+        Level::Avator
+    }
+    fn execute(&self, c: &mut Object<R, V>) {
+        use GameCommand::Move;
+        match *self {
+            Move(v) => { c.translate(v); },
+        }
+
+    }
+}
+impl<R: gfx::Resources, V> Command<HashMap<i32, Object<R, V>>> for GameCommand {
+    fn get_level(&self) -> Level {
+        Level::Avator
+    }
+    fn execute(&self, c: &mut HashMap<i32, Object<R, V>>) {
+        use GameCommand::Move;
+        match *self {
+            Move(v) => { c.get_mut(&1).unwrap().translate(v); },
+        }
+    }
+
+}
+
+
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum Level {
+    Avator,
+    System,
+    End,
+}
+
+
+
+fn handle_input(ev :glutin::Event) -> Option<GameCommand> {
     match ev {
         glutin::Event::KeyboardInput(_, _, Some(glutin::VirtualKeyCode::Escape)) |
-            glutin::Event::Closed => Some(GameCommand::Exit),
-            glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::L)) 
-                => Some(GameCommand::CameraMove(Vector3::new(0.5,0.0,0.0))),
-            glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::H)) 
-                => Some(GameCommand::CameraMove(Vector3::new(-0.5,0.0,0.0))),
-            glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::J)) 
-                => Some(GameCommand::CameraMove(Vector3::new(0.0,0.0,-0.5))),
-            glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::K)) 
-                => Some(GameCommand::CameraMove(Vector3::new(0.0,0.0,0.5))),
+            // glutin::Event::Closed => Some(GameCommand::Exit),
+            // glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::L)) 
+            //     => Some(GameCommand::CameraMove(Vector3::new(0.5,0.0,0.0))),
+            // glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::H)) 
+            //     => Some(GameCommand::CameraMove(Vector3::new(-0.5,0.0,0.0))),
+            // glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::J)) 
+            //     => Some(GameCommand::CameraMove(Vector3::new(0.0,0.0,-0.5))),
+            // glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::K)) 
+            //     => Some(GameCommand::CameraMove(Vector3::new(0.0,0.0,0.5))),
             glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::W)) 
-                => Some(GameCommand::AvatorMove(Vector3::new(0.0, 0.1, 0.0))),
+                => Some(GameCommand::Move(Vector3::new(0.0, 0.1, 0.0))),
             glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::S)) 
-                => Some(GameCommand::AvatorMove(Vector3::new(0.0, -0.1, 0.0))),
+                => Some(GameCommand::Move(Vector3::new(0.0, -0.1, 0.0))),
             glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::A)) 
-                => Some(GameCommand::AvatorMove(Vector3::new(-0.1, 0.0, 0.0))),
+                => Some(GameCommand::Move(Vector3::new(-0.1, 0.0, 0.0))),
             glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::D)) 
-                => Some(GameCommand::AvatorMove(Vector3::new(0.1, 0.0, 0.0))),
-            glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::Z)) 
-                => Some(GameCommand::CameraMove(Vector3::new(0.0,0.5,0.0))),
-            glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::X)) 
-                => Some(GameCommand::CameraMove(Vector3::new(0.0,-0.5,0.0))),
+                => Some(GameCommand::Move(Vector3::new(0.1, 0.0, 0.0))),
+            // glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::Z)) 
+            //     => Some(GameCommand::CameraMove(Vector3::new(0.0,0.5,0.0))),
+            // glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::X)) 
+            //     => Some(GameCommand::CameraMove(Vector3::new(0.0,-0.5,0.0))),
             _   => { None }
     }
 }
@@ -382,9 +528,17 @@ pub struct Entry<R: gfx::Resources, V, View> {
 
 #[derive(Debug)]
 struct Joint {
+    joint_index: i32,
     pub global : Matrix4<f32>,
     bind: Matrix4<f32>,
     inverse: Matrix4<f32>
+}
+
+#[derive(Debug)]
+struct Animation {
+    joint_index: i32,
+    time: f32,
+    pose: Matrix4<f32>,
 }
 
 fn entry<R: gfx::Resources, F: gfx::Factory<R>, V, T: gfx::format::TextureFormat>(factory: &mut F, vertex_data: &[V], img: Image<T>) -> Entry<R, V, T::View> 
@@ -487,6 +641,7 @@ fn query_entry<R: gfx::Resources, F: gfx::Factory<R>>(conn: &Connection, factory
         let mut entries = Vec::new();
         let meshes = query_mesh(&conn, id)?;
         let joints = query_skeleton(&conn, id)?;
+        let animations = query_animation(&conn, id)?;
         for r in meshes
         {
             let vertex_data = r.0;
@@ -503,15 +658,8 @@ fn query_entry<R: gfx::Resources, F: gfx::Factory<R>>(conn: &Connection, factory
                           entries: entries,
                           position: Point3::new(0.0, 0.0, 0.0),
                           // front: Vector3::new(0.0, -1.0, 0.0)
-                          skinning: 
-                              if joints.len() > 0 {
-                                  joints.iter().map(|(i, j)| {
-                                                  Skinning{ transform: j.global.into()}
-                                  }).collect()
-                              } else { 
-                                  let identity: Matrix4<f32> = cgmath::One::one();
-                                  vec!({Skinning{ transform: identity.into()}})
-                              }
+                          joints: joints,
+                          animations: animations
                       });
     }
     Ok(result)
@@ -521,7 +669,8 @@ struct Object<R: gfx::Resources, V> {
     entries: Vec<Entry<R, V, [f32;4]>>,
     position: Point3<f32>,
     // front: Vector3<f32>,
-    skinning: Vec<Skinning>
+    joints: HashMap<i32, Joint>,
+    animations: HashMap<i32, Vec<(f32, Animation)>>,
 }
 
 trait Translate<T: cgmath::BaseFloat> {
@@ -536,6 +685,34 @@ impl<R: gfx::Resources, V> Translate<f32> for Object<R, V>{
 impl<T: cgmath::BaseFloat> Translate<T> for Camera<T> {
     fn translate(&mut self, v: Vector3<T>) {
         self.position += v;
+    }
+}
+
+impl<R: gfx::Resources, V> Object<R, V> {
+    fn get_skinning(&self, time: f64) -> Vec<Skinning> {
+        if self.joints.len() > 0 {
+            self.joints.iter().map(|(i, j)| {
+                let animations = match self.animations.get(i) {
+                    Some(v) => {
+                        let length = v.len();
+                        let sample_per_second = length as f64 / 4.0;
+                        let t = time * sample_per_second;
+
+                        let index_1 = t.floor() as usize;
+                        let index_2 = t.ceil() as usize;
+
+                        let sample_1 = &v[index_1];
+                        let sample_2 = &v[index_2];
+                    },
+                    _ => {}
+                };
+
+                Skinning{ transform: j.global.into()}
+            }).collect()
+        } else { 
+            let identity: Matrix4<f32> = cgmath::One::one();
+            vec!({Skinning{ transform: identity.into()}})
+        }
     }
 }
 
@@ -726,12 +903,87 @@ ORDER BY JointIndex
 
         joints.insert(inx,
                       Joint {
+                          joint_index: inx,
                           global: m,
                           bind: bind,
                           inverse : inverse,
                       });
     }
     Ok(joints)
+}
+
+fn query_animation(conn: &Connection, object_id: &i32) -> RusqliteResult<HashMap<i32, Vec<(f32, Animation)>>> {
+    let mut stmt = conn.prepare("
+SELECT
+    AnimationId ,
+    ObjectId    ,
+    JointIndex  ,
+    SampleTime  ,
+    SamplePose11,
+    SamplePose12,
+    SamplePose13,
+    SamplePose14,
+    SamplePose21,
+    SamplePose22,
+    SamplePose23,
+    SamplePose24,
+    SamplePose31,
+    SamplePose32,
+    SamplePose33,
+    SamplePose34,
+    SamplePose41,
+    SamplePose42,
+    SamplePose43,
+    SamplePose44,
+    Name        
+  FROM Animation AS A
+WHERE A.ObjectId = ?1
+Order By AnimationId, JointIndex
+")?;
+    let result = stmt.query_map(&[object_id], |r| {
+        ( r.get::<&str,i32>("AnimationId"),
+          r.get::<&str,i32>("JointIndex"),
+          r.get::<&str,f64>("SampleTime"),
+          Matrix4::new(r.get::<&str,f64>("SamplePose11") as f32,
+                       r.get::<&str,f64>("SamplePose12") as f32,
+                       r.get::<&str,f64>("SamplePose13") as f32,
+                       r.get::<&str,f64>("SamplePose14") as f32,
+                       r.get::<&str,f64>("SamplePose21") as f32,
+                       r.get::<&str,f64>("SamplePose22") as f32,
+                       r.get::<&str,f64>("SamplePose23") as f32,
+                       r.get::<&str,f64>("SamplePose24") as f32,
+                       r.get::<&str,f64>("SamplePose31") as f32,
+                       r.get::<&str,f64>("SamplePose32") as f32,
+                       r.get::<&str,f64>("SamplePose33") as f32,
+                       r.get::<&str,f64>("SamplePose34") as f32,
+                       r.get::<&str,f64>("SamplePose41") as f32,
+                       r.get::<&str,f64>("SamplePose42") as f32,
+                       r.get::<&str,f64>("SamplePose43") as f32,
+                       r.get::<&str,f64>("SamplePose44") as f32),
+        )
+    })?;
+
+    let mut animations = HashMap::<i32, Vec<(f32, Animation)>>::default();
+    for r in result
+    {
+        let (_, joint_index, time, pose) = r?;
+
+        (|t: (f32, Animation) | {
+            if animations.contains_key(&joint_index) {
+                if let Some(v) = animations.get_mut(&joint_index) {
+                    v.push(t);
+                };
+            } else {
+                animations.insert(joint_index, vec!(t));
+            };
+        })((time as f32,
+            Animation {
+                joint_index: joint_index,
+                time: time as f32,
+                pose : pose,
+        }));
+    }
+    Ok(animations)
 }
 
 
