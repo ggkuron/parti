@@ -140,11 +140,10 @@ void main() {
     };
     
     let mut encoder: gfx::Encoder<_, _> = factory.create_command_buffer().into();
-
-    let mut invoker = Invoker::<GameCommand, HashMap<i32, Object<_, _>>>::new(
+    let mut invoker = Invoker::<GameCommand, HashMap<i32, Object<_, _>>, _>::new(
         Level::Avator, query_entry(&conn, &mut factory, &[1,2]).unwrap(),
         Some(Box::new(
-                Invoker::<GameCommand, Camera<f32>>::new(
+                Invoker::<GameCommand, Camera<f32>, ()>::new(
                     Level::System,
                     Camera::new(
                         Point3::new(30.0, -40.0, 30.0),
@@ -159,15 +158,6 @@ void main() {
             ))
     );
 
-    let mut camera = Camera::new(
-                    Point3::new(30.0, -40.0, 30.0),
-                    Point3::new(0.0, 0.0, 0.0),
-                    cgmath::PerspectiveFov {
-                        fovy: cgmath::Rad(16.0f32.to_radians()),
-                        aspect: (width as f32) / (height as f32),
-                        near: 5.0,
-                        far: 1000.0,
-                });
 
     // let mut avator = entries.get_mut(&1).unwrap();
 
@@ -192,34 +182,37 @@ void main() {
                 _ => {}
             }
         }
-        invoker.execute_all_commands();
-
         // cmd_avator.process_request(&mut command_requests_avator);
         // asset_manager.update_camera();
         // let camera = &asset_manager.camera;
+        invoker.execute_all_commands();
 
         encoder.clear(&main_color.clone(), CLEAR_COLOR);
         encoder.clear_depth(&main_depth, 1.0);
     
         for obj in invoker.target.values() {
-            let mv = camera.view * Matrix4::from_translation(obj.position.to_vec());
-            let mvp = camera.perspective * mv;
-            let skinning_buffer = factory.create_constant_buffer::<Skinning>(64);
-            encoder.update_buffer(&skinning_buffer, &obj.get_skinning(elapsed)[..], 0).unwrap();
-            for entry in &obj.entries {
-                let data = pipe_w::Data {
-                    vbuf: entry.vertex_buffer.clone(),
-                    u_model_view_proj: mvp.into(),
-                    u_model_view: mv.into(),
-                    u_light: [0.2, 0.2, -0.2f32],
-                    u_ambient_color: [0.01, 0.01, 0.01, 1.0],
-                    u_eye_direction: camera.direction().into(),
-                    u_texture: (entry.texture.clone(), sampler.clone()),
-                    out_color: main_color.clone(),
-                    out_depth: main_depth.clone(),
-                    b_skinning: skinning_buffer.raw().clone(),
-                };
-                encoder.draw(&entry.slice, &pso, &data);
+
+            if let Some(ref inv) = invoker.next {
+                let camera = inv.target();
+                let mv = camera.view * Matrix4::from_translation(obj.position.to_vec());
+                let mvp = camera.perspective * mv;
+                let skinning_buffer = factory.create_constant_buffer::<Skinning>(64);
+                encoder.update_buffer(&skinning_buffer, &obj.get_skinning(elapsed)[..], 0).unwrap();
+                for entry in &obj.entries {
+                    let data = pipe_w::Data {
+                        vbuf: entry.vertex_buffer.clone(),
+                        u_model_view_proj: mvp.into(),
+                        u_model_view: mv.into(),
+                        u_light: [0.2, 0.2, -0.2f32],
+                        u_ambient_color: [0.01, 0.01, 0.01, 1.0],
+                        u_eye_direction: camera.direction().into(),
+                        u_texture: (entry.texture.clone(), sampler.clone()),
+                        out_color: main_color.clone(),
+                        out_depth: main_depth.clone(),
+                        b_skinning: skinning_buffer.raw().clone(),
+                    };
+                    encoder.draw(&entry.slice, &pso, &data);
+                }
             }
         }
         {
@@ -266,8 +259,16 @@ void main() {
 }
 
 enum GameCommand {
-    Move (Vector3<f32>),
+   AvatorCommand(AvatorCommand),
+   CameraCommand(CameraCommand),
     // Exit,
+}
+enum AvatorCommand {
+    Move (Vector3<f32>),
+}
+enum CameraCommand {
+    Move (Vector3<f32>),
+    LookTo (Vector3<f32>),
 }
 
 trait Request {
@@ -279,17 +280,17 @@ trait Command<T> {
     fn execute(&self, &mut T);
 }
 
-struct Invoker<Cmd, T> {
+struct Invoker<Cmd, T, U> {
     commands: Vec<Cmd>,
     target: T,
     current_index: usize,
 
-    next: Option<Box<Request>>,
+    next: Option<Box<U>>,
     allowable_level: Level,
 }
 
-impl<CmdT, T> Invoker<CmdT, T> {
-    fn new(l: Level, t: T, next: Option<Box<Request>>) -> Self {
+impl<Cmd, T, U, V> Invoker<Cmd, T, Invoker<Cmd, U, V>> {
+    fn new(l: Level, t: T, next: Option<Box<Invoker<Cmd, U, V>>>) -> Self {
         Invoker {
             commands: Vec::new(),
             target: t,
@@ -302,13 +303,10 @@ impl<CmdT, T> Invoker<CmdT, T> {
     fn target(&self) -> &T {
         &self.target
     }
-    fn append_command(&mut self, c: CmdT) {
-        self.commands.push(c);
-    }
 }
 
-impl<CmdT, T> Invoker<CmdT, T>
-    where CmdT: Command<T> {
+impl<Cmd, T, U, V> Invoker<Cmd, T, Invoker<Cmd, U, V>>
+    where Cmd: Command<T> {
     fn execute_command(&mut self) {
         if self.commands.len() <= self.current_index {
             return;
@@ -331,23 +329,50 @@ impl<CmdT, T> Invoker<CmdT, T>
             self.execute_command();
         }
     }
+    fn append_command(&mut self, c: Cmd) {
+        if self.allowable_level == c.get_level() {
+            self.commands.push(c);
+        } else {
+            if let Some(ref mut next) = self.next {
+                // next.append_command(c);
+            }
+        }
+    }
+    fn append_next(&mut self, c: Cmd) {
+        if let Some(ref mut next) = self.next {
+            next.append_command(c)
+        }
+    }
+
 }
-impl<CmdT, T> Request for Invoker<CmdT, T>
-    where CmdT: Command<T> {
+impl<Cmd, T, U> Request for Invoker<Cmd, T, U>
+    where Cmd: Command<T>  {
     fn submit(&mut self) {
         self.execute_command();
+    }
+}
+
+impl Command<()> for GameCommand {
+    fn get_level(&self) -> Level {
+        Level::System
+    }
+    fn execute(&self, c: &mut ()) {
+        // do nothing
     }
 }
 
 
 impl Command<Camera<f32>> for GameCommand {
     fn get_level(&self) -> Level {
-        Level::Avator
+        Level::System
     }
     fn execute(&self, c: &mut Camera<f32>) {
-        use GameCommand::Move;
         match *self {
-            Move(v) => { c.translate(v); },
+            GameCommand::CameraCommand(CameraCommand::Move(v)) => {
+                c.translate(v); 
+                c.update();
+            },
+            _ => {}
         }
     }
 }
@@ -357,9 +382,11 @@ impl<R: gfx::Resources, V> Command<Object<R, V>> for GameCommand {
         Level::Avator
     }
     fn execute(&self, c: &mut Object<R, V>) {
-        use GameCommand::Move;
         match *self {
-            Move(v) => { c.translate(v); },
+            GameCommand::AvatorCommand(AvatorCommand::Move(v)) => {
+                c.translate(v); 
+            },
+            _ => {}
         }
 
     }
@@ -369,9 +396,11 @@ impl<R: gfx::Resources, V> Command<HashMap<i32, Object<R, V>>> for GameCommand {
         Level::Avator
     }
     fn execute(&self, c: &mut HashMap<i32, Object<R, V>>) {
-        use GameCommand::Move;
         match *self {
-            Move(v) => { c.get_mut(&1).unwrap().translate(v); },
+            GameCommand::AvatorCommand(AvatorCommand::Move(v)) => {
+                c.get_mut(&1).unwrap().translate(v); 
+            },
+            _ => {}
         }
     }
 
@@ -383,7 +412,6 @@ impl<R: gfx::Resources, V> Command<HashMap<i32, Object<R, V>>> for GameCommand {
 enum Level {
     Avator,
     System,
-    End,
 }
 
 
@@ -392,22 +420,22 @@ fn handle_input(ev :glutin::Event) -> Option<GameCommand> {
     match ev {
         glutin::Event::KeyboardInput(_, _, Some(glutin::VirtualKeyCode::Escape)) |
             // glutin::Event::Closed => Some(GameCommand::Exit),
-            // glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::L)) 
-            //     => Some(GameCommand::CameraMove(Vector3::new(0.5,0.0,0.0))),
-            // glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::H)) 
-            //     => Some(GameCommand::CameraMove(Vector3::new(-0.5,0.0,0.0))),
-            // glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::J)) 
-            //     => Some(GameCommand::CameraMove(Vector3::new(0.0,0.0,-0.5))),
-            // glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::K)) 
-            //     => Some(GameCommand::CameraMove(Vector3::new(0.0,0.0,0.5))),
+            glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::L)) 
+                => Some(GameCommand::CameraCommand(CameraCommand::Move(Vector3::new(0.5,0.0,0.0)))),
+            glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::H)) 
+                => Some(GameCommand::CameraCommand(CameraCommand::Move(Vector3::new(-0.5,0.0,0.0)))),
+            glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::J)) 
+                => Some(GameCommand::CameraCommand(CameraCommand::Move(Vector3::new(0.0,0.0,-0.5)))),
+            glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::K)) 
+                => Some(GameCommand::CameraCommand(CameraCommand::Move(Vector3::new(0.0,0.0,0.5)))),
             glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::W)) 
-                => Some(GameCommand::Move(Vector3::new(0.0, 0.1, 0.0))),
+                => Some(GameCommand::AvatorCommand(AvatorCommand::Move(Vector3::new(0.0, 0.1, 0.0)))),
             glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::S)) 
-                => Some(GameCommand::Move(Vector3::new(0.0, -0.1, 0.0))),
+                => Some(GameCommand::AvatorCommand(AvatorCommand::Move(Vector3::new(0.0, -0.1, 0.0)))),
             glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::A)) 
-                => Some(GameCommand::Move(Vector3::new(-0.1, 0.0, 0.0))),
+                => Some(GameCommand::AvatorCommand(AvatorCommand::Move(Vector3::new(-0.1, 0.0, 0.0)))),
             glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::D)) 
-                => Some(GameCommand::Move(Vector3::new(0.1, 0.0, 0.0))),
+                => Some(GameCommand::AvatorCommand(AvatorCommand::Move(Vector3::new(0.1, 0.0, 0.0)))),
             // glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::Z)) 
             //     => Some(GameCommand::CameraMove(Vector3::new(0.0,0.5,0.0))),
             // glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::X)) 
