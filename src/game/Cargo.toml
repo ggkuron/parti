@@ -1,14 +1,12 @@
 [package]
-name = "parti"
+name = "parti-game"
 version = "0.0.0"
 authors = ["ggkuron"]
+build = "build.rs"
 
-[[bin]]
-name = "parti"
-path = "src/main.rs"
-
-[dependencies.parti-game]
-path = "src/game"
+[lib]
+name = "parti_game"
+path = "lib.rs"
 
 [dependencies]
 glutin = "0.7"
