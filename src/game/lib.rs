@@ -20,10 +20,13 @@ use freetype as ft;
 use freetype::Error as FreetypeError;
 use freetype::Face;
 
+use gfx::{Adapter, CommandQueue, Device, FrameSync, GraphicsPoolExt,
+          Surface, Swapchain, WindowExt};
 use gfx::memory::Typed;
+use gfx::format::Formatted;
 
 pub type ColorFormat = gfx::format::Srgba8;
-pub type DepthFormat = gfx::format::Depth;
+pub type DepthFormat = gfx::format::DepthStencil;
 
 // TODO push down automaton
 
@@ -65,33 +68,80 @@ impl<T: gfx::format::TextureFormat> From<Font> for Image<T> {
     fn from(f: Font) -> Image<T> { Image { data: f.image, width: f.width, height: f.height , format: std::marker::PhantomData::<T>} }
 }
 
-pub struct App {
-    pso: gfx::PipelineState<gfx_device_gl::Resources, pipe_w::Meta>,
-    pso_w2: gfx::PipelineState<gfx_device_gl::Resources, pipe_w2::Meta>,
-    pso_p: gfx::PipelineState<gfx_device_gl::Resources, pipe_p::Meta>,
-    sampler: gfx::handle::Sampler<gfx_device_gl::Resources>,
-    encoder: gfx::Encoder<gfx_device_gl::Resources, gfx_device_gl::CommandBuffer>,
-    invoker: CommandInterpreter<gfx_device_gl::Resources, Vertex>,
-    main_color: gfx::handle::RenderTargetView<gfx_device_gl::Resources, ColorFormat>,
-    main_depth: gfx::handle::DepthStencilView<gfx_device_gl::Resources, DepthFormat>,
-    skinning_buffer: gfx::handle::Buffer<gfx_device_gl::Resources, Skinning>,
-    factory: gfx_device_gl::Factory,
+pub struct App<R: gfx::Resources, B: gfx::Backend> {
+    pso: gfx::PipelineState<R, pipe_w::Meta>,
+    pso_w2: gfx::PipelineState<R, pipe_w2::Meta>,
+    pso_p: gfx::PipelineState<R, pipe_p::Meta>,
+    sampler: gfx::handle::Sampler<R>,
+    invoker: CommandInterpreter<R, Vertex>,
+    views: Vec<(gfx::handle::RenderTargetView<R, ColorFormat>,
+                gfx::handle::DepthStencilView<R, DepthFormat>)>,
+    skinning_buffer: gfx::handle::Buffer<R, Skinning>,
+    device: gfx_device_gl::Device,
+    graphics_pool: gfx::GraphicsCommandPool<B>,
+
+    swap_chain: gfx_window_glutin::Swapchain,
+
+    frame_semaphore: gfx::handle::Semaphore<R>,
+    draw_semaphore: gfx::handle::Semaphore<R>,
+
+    frame_fence: gfx::handle::Fence<R>,
+    graphics_queue: gfx::queue::GraphicsQueue<B>,
 }
 
-impl App {
+impl App<gfx_device_gl::Resources, gfx_device_gl::Backend> {
 
     pub fn new(
-        mut factory: gfx_device_gl::Factory,
-        main_color: gfx::handle::RenderTargetView<gfx_device_gl::Resources, ColorFormat>,
-        main_depth: gfx::handle::DepthStencilView<gfx_device_gl::Resources, DepthFormat>,
-        width: u32, height: u32,
-    ) -> App {
-        use gfx::traits::FactoryExt;
-        use gfx::Factory;
+        window: glutin::GlWindow,
+        width: u32,
+        height: u32,
+    ) -> App<gfx_device_gl::Resources, gfx_device_gl::Backend> {
+        use gfx::traits::DeviceExt;
+        use gfx::Device;
+
+        let (mut surface, adapters) = gfx_window_glutin::Window::new(window).get_surface_and_adapters();
+        let gfx::Gpu { mut device, mut graphics_queues, .. } = 
+            adapters[0].open_with(|family, ty| {
+                (
+                    (ty.supports_graphics() && surface.supports_queue(&family)) as u32,
+                    gfx::QueueType::Graphics
+                )
+            });
+        let graphics_queue = graphics_queues.pop().expect("Unable to find a graphics queue.");
+
+        let config = gfx::SwapchainConfig::new()
+            .with_color::<ColorFormat>()
+            .with_depth_stencil::<DepthFormat>();
+        let mut swap_chain = surface.build_swapchain(config, &graphics_queue);
+
+        let views: Vec<(gfx::handle::RenderTargetView<_, ColorFormat>,
+                        gfx::handle::DepthStencilView<_, DepthFormat>)> = swap_chain
+            .get_backbuffers()
+            .iter()
+            .map(|&(ref color, ref ds)| {
+                let color_desc = gfx::texture::RenderDesc {
+                    channel: ColorFormat::get_format().1,
+                    level: 0,
+                    layer: None,
+                };
+                let rtv = device.view_texture_as_render_target_raw(color, color_desc).expect("rtv");
+                let ds_desc = gfx::texture::DepthStencilDesc {
+                    level: 0,
+                    layer: None,
+                    flags: gfx::texture::DepthStencilFlags::empty(),
+                };
+                let dsv = device.view_texture_as_depth_stencil_raw(
+                    ds.as_ref().expect("ds"),
+                    ds_desc
+                ).expect("dsv");
+
+                (Typed::new(rtv), Typed::new(dsv))
+            }).collect();
+
 
         let pso = {
-            let shaders = factory.create_shader_set(b"
-            #version 150 core
+            let shaders = device.create_shader_set(
+          b"#version 150 core
             
             uniform mat4 u_model_view_proj;
             uniform mat4 u_model_view;
@@ -126,8 +176,7 @@ impl App {
                 _normal = normalize(bindNormal).xyz;
             }
             ",
-            b"
-            #version 150 core
+          b"#version 150 core
             
             uniform vec3 u_light;
             uniform vec4 u_ambientColor;
@@ -147,7 +196,7 @@ impl App {
                 Target0 = texColor * vec4(vec3(diffuse), 1.0) + vec4(vec3(specular), 1.0) + u_ambientColor;
             }
             ").expect("shader exists?");
-            factory.create_pipeline_state(
+            device.create_pipeline_state(
                 &shaders,
                 gfx::Primitive::TriangleList,
                 gfx::state::Rasterizer::new_fill(),
@@ -155,7 +204,7 @@ impl App {
                 ).expect("failed to create pipeline w")
         };
         let pso_w2 = {
-            let shaders = factory.create_shader_set(b"
+            let shaders = device.create_shader_set(b"
             #version 150 core
             
             uniform mat4 u_model_view_proj;
@@ -196,7 +245,7 @@ impl App {
             }
             ",
             ).expect("shader exists?");
-            factory.create_pipeline_state(
+            device.create_pipeline_state(
                 &shaders,
                 gfx::Primitive::TriangleList,
                 gfx::state::Rasterizer::new_fill(),
@@ -204,7 +253,7 @@ impl App {
                 ).expect("failed to create pipeline w2")
         };
         let pso_p = {
-            let shaders = factory.create_shader_set(b"
+            let shaders = device.create_shader_set(b"
             #version 150 core
             
             in vec3 position;
@@ -225,43 +274,52 @@ impl App {
                 Target0 = v_color;
             }
             ").expect("shader error");
-            factory.create_pipeline_state(
+            device.create_pipeline_state(
                 &shaders,
                 gfx::Primitive::LineStrip,
                 gfx::state::Rasterizer::new_fill().with_cull_back(),
                 pipe_p::new()
                 ).expect("failed to create pipeline p")
         };
+
+        let graphics_pool = graphics_queue.create_graphics_pool(1);
             
         let sampler = {
             let sampler_info = gfx::texture::SamplerInfo::new(
                 gfx::texture::FilterMethod::Trilinear,
                 gfx::texture::WrapMode::Clamp);
-            factory.create_sampler(sampler_info)
+            device.create_sampler(sampler_info)
         };
         
-        let encoder: gfx::Encoder<_, _> = factory.create_command_buffer().into();
-        let skinning_buffer = factory.create_constant_buffer::<Skinning>(64);
+        let skinning_buffer = device.create_constant_buffer::<Skinning>(64);
         let invoker = CommandInterpreter::new(
-            &mut factory,
+            &mut device,
             (width as f32) / (height as f32)
         );
 
+        let frame_semaphore = device.create_semaphore();
+        let draw_semaphore = device.create_semaphore();
+        let frame_fence = device.create_fence(false);
+
         App {
-            factory,
+            device,
             sampler,
             pso,
             pso_w2,
             pso_p,
-            encoder,
             skinning_buffer,
-            main_color,
-            main_depth,
             invoker,
+            frame_semaphore,
+            draw_semaphore,
+            frame_fence,
+            graphics_pool,
+            swap_chain,
+            graphics_queue,
+            views,
         }
     }
 
-    pub fn handle_input(&mut self, ev :glutin::Event) {
+    pub fn handle_input(&mut self, ev :glutin::WindowEvent) {
         self.invoker.handle_input(ev)
     }
 
@@ -269,61 +327,70 @@ impl App {
         self.invoker.execute_all_commands()
     }
 
-    pub fn render(&mut self, device: &mut gfx_device_gl::Device) {
+    pub fn render(&mut self) {
         self.pre_render();
 
         let elapsed = self.invoker.system.target.timer.elapsed().as_f64();
 
-        let encoder = &mut self.encoder;
         let sampler = &mut self.sampler;
-        let main_color = &mut self.main_color;
-        let main_depth = &mut self.main_depth;
 
-        encoder.clear(&main_color.clone(), CLEAR_COLOR);
-        encoder.clear_depth(&main_depth, 1.0);
-
-        for obj in self.invoker.target().values() {
-            let camera = self.invoker.camera(); 
-            let mv = camera.view * Matrix4::from_translation(obj.position.to_vec());
-            let mvp = camera.perspective * mv;
-            {
-                let a = obj.get_skinning(elapsed);
-                encoder.update_buffer(&self.skinning_buffer, &a[..], 0).unwrap();
-            }
-            for entry in &obj.entries {
-                let data = pipe_w::Data {
-                    vbuf: entry.vertex_buffer.clone(),
-                    u_model_view_proj: mvp.into(),
-                    u_model_view: mv.into(),
-                    u_light: [0.2, 0.2, -0.2f32],
-                    u_ambient_color: [0.01, 0.01, 0.01, 1.0],
-                    u_eye_direction: camera.direction().into(),
-                    u_texture: (entry.texture.clone(), sampler.clone()),
-                    out_color: main_color.clone(),
-                    out_depth: main_depth.clone(),
-                    b_skinning: self.skinning_buffer.raw().clone(),
-                };
-                encoder.draw(&entry.slice, &self.pso, &data);
-            }
-        }
+        let frame = self.swap_chain.acquire_frame(FrameSync::Semaphore(&self.frame_semaphore));
+        let view = self.views[frame.id()].clone();
         {
-            let camera = self.invoker.camera(); 
-            let font_entry = font_entry(&mut self.factory, &format!("{:?}", elapsed)).unwrap();
+            let mut encoder = self.graphics_pool.acquire_graphics_encoder();
 
-            let data = pipe_w2::Data {
-                vbuf: font_entry.vertex_buffer.clone(),
-                u_model_view_proj: camera.projection.into(),
-                u_model_view: camera.view.into(),
-                u_light: [1.0, 0.5, -0.5f32],
-                u_ambient_color: [0.00, 0.00, 0.01, 0.4],
-                u_eye_direction: camera.direction().into(),
-                u_texture: (font_entry.texture.clone(), sampler.clone()),
-                out_color: main_color.clone(),
-                out_depth: main_depth.clone()
-            };
-            encoder.draw(&font_entry.slice, &self.pso_w2, &data);
+            encoder.clear(&view.0.clone(), CLEAR_COLOR);
+            encoder.clear_depth(&view.1.clone(), 1.0);
+
+
+            for obj in self.invoker.target().values() {
+                let camera = self.invoker.camera(); 
+                let mv = camera.view * Matrix4::from_translation(obj.position.to_vec());
+                let mvp = camera.perspective * mv;
+                {
+                    let a = obj.get_skinning(elapsed);
+                    encoder.update_buffer(&self.skinning_buffer, &a[..], 0).expect("ub");
+                }
+                for entry in &obj.entries {
+                    let data = pipe_w::Data {
+                        vbuf: entry.vertex_buffer.clone(),
+                        u_model_view_proj: mvp.into(),
+                        u_model_view: mv.into(),
+                        u_light: [0.2, 0.2, -0.2f32],
+                        u_ambient_color: [0.01, 0.01, 0.01, 1.0],
+                        u_eye_direction: camera.direction().into(),
+                        u_texture: (entry.texture.clone(), sampler.clone()),
+                        out_color: view.0.clone(),
+                        out_depth: view.1.clone(),
+                        b_skinning: self.skinning_buffer.raw().clone(),
+                    };
+                    encoder.draw(&entry.slice, &self.pso, &data);
+                }
+            }
+            {
+                let camera = self.invoker.camera(); 
+                let font_entry = font_entry(&mut self.device, &format!("{:?}", elapsed)).expect("fe");
+
+                let data = pipe_w2::Data {
+                    vbuf: font_entry.vertex_buffer.clone(),
+                    u_model_view_proj: camera.projection.into(),
+                    u_model_view: camera.view.into(),
+                    u_light: [1.0, 0.5, -0.5f32],
+                    u_ambient_color: [0.00, 0.00, 0.01, 0.4],
+                    u_eye_direction: camera.direction().into(),
+                    u_texture: (font_entry.texture.clone(), sampler.clone()),
+                    out_color: view.0.clone(),
+                    out_depth: view.1.clone()
+                };
+                encoder.draw(&font_entry.slice, &self.pso_w2, &data);
+            }
+            encoder.synced_flush(&mut self.graphics_queue, &[&self.frame_semaphore], &[&self.draw_semaphore], Some(&self.frame_fence))
+                .expect("Colud not flush encoder");
         }
-        encoder.flush(device);
+        self.swap_chain.present(&mut self.graphics_queue, &[&self.draw_semaphore]);
+        self.device.wait_for_fences(&[&self.frame_fence], gfx::WaitFor::All, 1_000_000);
+        self.graphics_queue.cleanup();
+        self.graphics_pool.reset();
     }
 }
 
@@ -362,11 +429,11 @@ struct CommandInterpreter<R: gfx::Resources, V> {
 }
 
 impl<R: gfx::Resources> CommandInterpreter<R, Vertex> {
-    fn new<F: gfx::Factory<R>>(factory: &mut F, aspect: f32) -> Self {
+    fn new<F: gfx::Device<R>>(device: &mut F, aspect: f32) -> Self {
         let conn = Connection::open(&Path::new("file.db")).expect("failed to open sqlite file");
         CommandInterpreter {
             avators: Invoker::<AvatorCommand, HashMap<i32, Object<R, _>>>::new(
-                        query_entry::<R, F>(&conn, factory, &[1,2]).unwrap()),
+                        query_entry::<R, F>(&conn, device, &[1,2]).unwrap()),
             camera: Invoker::<CameraCommand, Camera<f32>>::new(
                         Camera::new(
                             Point3::new(30.0, -40.0, 30.0),
@@ -389,24 +456,56 @@ impl<R: gfx::Resources> CommandInterpreter<R, Vertex> {
     fn camera(&self) -> &Camera<f32> {
         &self.camera.target
     }
-    fn handle_input(&mut self, ev :glutin::Event) {
+    fn handle_input(&mut self, ev: glutin::WindowEvent) {
         match ev {
-                glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::L)) 
-                    => self.avators.append_command(AvatorCommand::Move(Vector3::new(0.5,0.0,0.0))),
-                glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::H)) 
-                    => self.avators.append_command(AvatorCommand::Move(Vector3::new(-0.5,0.0,0.0))),
-                glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::J)) 
-                    => self.avators.append_command(AvatorCommand::Move(Vector3::new(0.0,-0.5,0.0))),
-                glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::K)) 
-                    => self.avators.append_command(AvatorCommand::Move(Vector3::new(0.0,0.5,0.0))),
-                glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::W)) 
-                    => self.camera.append_command(CameraCommand::Move(Vector3::new(0.0, 0.1, 0.0))),
-                glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::S)) 
-                    => self.camera.append_command(CameraCommand::Move(Vector3::new(0.0, -0.1, 0.0))),
-                glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::A)) 
-                    => self.camera.append_command(CameraCommand::Move(Vector3::new(-0.1, 0.0, 0.0))),
-                glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::D)) 
-                    => self.camera.append_command(CameraCommand::Move(Vector3::new(0.1, 0.0, 0.0))),
+                glutin::WindowEvent::KeyboardInput {
+                    input: glutin::KeyboardInput {
+                        state: glutin::ElementState::Pressed,
+                        virtual_keycode: Some(glutin::VirtualKeyCode::L), ..
+                    }, ..
+                } => self.avators.append_command(AvatorCommand::Move(Vector3::new(0.5,0.0,0.0))),
+                glutin::WindowEvent::KeyboardInput {
+                    input: glutin::KeyboardInput {
+                        state: glutin::ElementState::Pressed,
+                        virtual_keycode: Some(glutin::VirtualKeyCode::H), ..
+                    }, ..
+                } => self.avators.append_command(AvatorCommand::Move(Vector3::new(-0.5,0.0,0.0))),
+                glutin::WindowEvent::KeyboardInput {
+                    input: glutin::KeyboardInput {
+                        state: glutin::ElementState::Pressed,
+                        virtual_keycode: Some(glutin::VirtualKeyCode::J), ..
+                    }, ..
+                } => self.avators.append_command(AvatorCommand::Move(Vector3::new(0.0,-0.5,0.0))),
+                glutin::WindowEvent::KeyboardInput {
+                    input: glutin::KeyboardInput {
+                        state: glutin::ElementState::Pressed,
+                        virtual_keycode: Some(glutin::VirtualKeyCode::K), ..
+                    }, ..
+                } => self.avators.append_command(AvatorCommand::Move(Vector3::new(0.0,0.5,0.0))),
+                glutin::WindowEvent::KeyboardInput {
+                    input: glutin::KeyboardInput {
+                        state: glutin::ElementState::Pressed,
+                        virtual_keycode: Some(glutin::VirtualKeyCode::W), ..
+                    }, ..
+                } => self.camera.append_command(CameraCommand::Move(Vector3::new(0.0, 0.1, 0.0))),
+                glutin::WindowEvent::KeyboardInput {
+                    input: glutin::KeyboardInput {
+                        state: glutin::ElementState::Pressed,
+                        virtual_keycode: Some(glutin::VirtualKeyCode::S), ..
+                    }, ..
+                } => self.camera.append_command(CameraCommand::Move(Vector3::new(0.0, -0.1, 0.0))),
+                glutin::WindowEvent::KeyboardInput {
+                    input: glutin::KeyboardInput {
+                        state: glutin::ElementState::Pressed,
+                        virtual_keycode: Some(glutin::VirtualKeyCode::A), ..
+                    }, ..
+                } => self.camera.append_command(CameraCommand::Move(Vector3::new(-0.1, 0.0, 0.0))),
+                glutin::WindowEvent::KeyboardInput {
+                    input: glutin::KeyboardInput {
+                        state: glutin::ElementState::Pressed,
+                        virtual_keycode: Some(glutin::VirtualKeyCode::D), ..
+                    }, ..
+                } => self.camera.append_command(CameraCommand::Move(Vector3::new(0.1, 0.0, 0.0))),
                 // glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::Z)) 
                 //     => Some(GameCommand::CameraMove(Vector3::new(0.0,0.5,0.0))),
                 // glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::X)) 
@@ -467,7 +566,6 @@ impl Command<Camera<f32>> for CameraCommand {
                 c.translate(v); 
                 c.update();
             },
-            _ => {}
         }
     }
 }
@@ -631,20 +729,20 @@ struct Animation {
     pose: Matrix4<f32>,
 }
 
-fn entry<R: gfx::Resources, F: gfx::Factory<R>, V, T: gfx::format::TextureFormat>(factory: &mut F, vertex_data: &[V], img: Image<T>) -> Entry<R, V, T::View> 
+fn entry<R: gfx::Resources, F: gfx::Device<R>, V, T: gfx::format::TextureFormat>(device: &mut F, vertex_data: &[V], img: Image<T>) -> Entry<R, V, T::View> 
 where V: gfx::traits::Pod + gfx::pso::buffer::Structure<gfx::format::Format> {
     let index_data: Vec<u32> = vertex_data.iter().enumerate().map(|(i, _)| i as u32).collect();
-    entry_(factory, &vertex_data, &index_data[..], img)
+    entry_(device, &vertex_data, &index_data[..], img)
 }
 
 
-fn entry_<R: gfx::Resources, F: gfx::Factory<R>, V, T: gfx::format::TextureFormat>(factory: &mut F, vertex_data: &[V], index_data: &[u32], img: Image<T>) -> Entry<R, V, T::View> 
+fn entry_<R: gfx::Resources, F: gfx::Device<R>, V, T: gfx::format::TextureFormat>(device: &mut F, vertex_data: &[V], index_data: &[u32], img: Image<T>) -> Entry<R, V, T::View> 
 where V: gfx::traits::Pod + gfx::pso::buffer::Structure<gfx::format::Format> {
-    use gfx::traits::FactoryExt;
-    let (vbuf, slice) = factory.create_vertex_buffer_with_slice(&vertex_data, index_data);
+    use gfx::traits::DeviceExt;
+    let (vbuf, slice) = device.create_vertex_buffer_with_slice(&vertex_data, index_data);
 
     let tex_kind = gfx::texture::Kind::D2(img.width, img.height, gfx::texture::AaMode::Single);
-    let (_, view) = factory.create_texture_immutable_u8::<T>(tex_kind, &[&img.data]).expect("create texture failure");
+    let (_, view) = device.create_texture_immutable_u8::<T>(tex_kind, &[&img.data]).expect("create texture failure");
 
     Entry {
         slice: slice,
@@ -653,13 +751,13 @@ where V: gfx::traits::Pod + gfx::pso::buffer::Structure<gfx::format::Format> {
     }
 }
 
-fn font_entry<R: gfx::Resources, F: gfx::Factory<R>>(factory: &mut F, text: &str) -> Result<Entry<R, Vertex, f32>,FontError> {
+fn font_entry<R: gfx::Resources, F: gfx::Device<R>>(device: &mut F, text: &str) -> Result<Entry<R, Vertex, f32>,FontError> {
     let chars: Vec<char> = "雑に文字描画abcdef0123456789.+-_".chars().map(|c| c).collect();
     Font::from_path("assets/VL-PGothic-Regular.ttf", 8, Some(&chars[..]))
-    .and_then(|font| Ok(font_entry_(factory, font, text)))
+    .and_then(|font| Ok(font_entry_(device, font, text)))
 }
 
-fn font_entry_<R: gfx::Resources, F: gfx::Factory<R>>(factory: &mut F, font: Font, text: &str) -> Entry<R, Vertex, f32>  {
+fn font_entry_<R: gfx::Resources, F: gfx::Device<R>>(device: &mut F, font: Font, text: &str) -> Entry<R, Vertex, f32>  {
     let mut vertex_data = Vec::new();
     let mut index_data = Vec::new();
 
@@ -716,12 +814,12 @@ fn font_entry_<R: gfx::Resources, F: gfx::Factory<R>>(factory: &mut F, font: Fon
 
         x += ch_info.x_advance as f32;
     }
-    entry_(factory,
+    entry_(device,
            vertex_data.as_slice(), index_data.as_slice(),
            Image::<(gfx::format::R8, gfx::format::Unorm)>::from(font))
 }
 
-fn query_entry<R: gfx::Resources, F: gfx::Factory<R>>(conn: &Connection, factory: &mut F, ids: &[i32]) -> RusqliteResult<HashMap<i32, Object<R, Vertex>>> {
+fn query_entry<R: gfx::Resources, F: gfx::Device<R>>(conn: &Connection, device: &mut F, ids: &[i32]) -> RusqliteResult<HashMap<i32, Object<R, Vertex>>> {
     let mut result = HashMap::default();
 
     for id in ids {
@@ -737,7 +835,7 @@ fn query_entry<R: gfx::Resources, F: gfx::Factory<R>>(conn: &Connection, factory
             let img = query_texture(&conn, texture_id).unwrap();
 
             entries.push(
-                entry(factory, vertex_data.as_slice(), img)
+                entry(device, vertex_data.as_slice(), img)
                 );
         }
         result.insert(id.clone(), 
@@ -1284,7 +1382,7 @@ impl Font {
         use std::char::from_u32;
         let mut result = HashSet::default();
         let mut index = 0;
-        let mut face_ptr = face.raw_mut();
+        let face_ptr = face.raw_mut();
         unsafe {
             let mut code = ft::ffi::FT_Get_First_Char(face_ptr, &mut index);
             while index != 0 {

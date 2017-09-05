@@ -9,18 +9,19 @@ name = "parti_game"
 path = "lib.rs"
 
 [dependencies]
-glutin = "0.7"
 cgmath = "0.12.0"
 rusqlite = "0.7.3"
 fnv = "1.0.3"
 coarsetime = "0.1"
 freetype-rs = "0.11"
+glutin = "0.9"
 [dependencies.gfx]
 git = "https://github.com/gfx-rs/gfx.git"
-rev = "784247d73688402157bbfb8672bcccf07aa10360"
+rev = "b2ad6160611cf3ed49e91e221fb902f089f89716"
 [dependencies.gfx_window_glutin]
 git = "https://github.com/gfx-rs/gfx.git"
-rev = "784247d73688402157bbfb8672bcccf07aa10360"
+rev = "b2ad6160611cf3ed49e91e221fb902f089f89716"
 [dependencies.gfx_device_gl]
 git = "https://github.com/gfx-rs/gfx.git"
-rev = "784247d73688402157bbfb8672bcccf07aa10360"
+rev = "b2ad6160611cf3ed49e91e221fb902f089f89716"
+
