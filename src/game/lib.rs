@@ -20,17 +20,25 @@ use freetype as ft;
 use freetype::Error as FreetypeError;
 use freetype::Face;
 
-use gfx::{Adapter, CommandQueue, Device, FrameSync, GraphicsPoolExt,
-          Surface, Swapchain, WindowExt};
+use gfx::{
+    Adapter,
+    CommandQueue,
+    Device,
+    FrameSync,
+    GraphicsPoolExt,
+    Surface,
+    Swapchain,
+    WindowExt
+};
 use gfx::memory::Typed;
 use gfx::format::Formatted;
 
 pub type ColorFormat = gfx::format::Srgba8;
 pub type DepthFormat = gfx::format::DepthStencil;
 
-// TODO push down automaton
+type TextureFormat = ColorFormat;
 
-use cgmath:: {
+use cgmath::{
     EuclideanSpace,
     Point3,
     Vector3,
@@ -68,15 +76,14 @@ impl<T: gfx::format::TextureFormat> From<Font> for Image<T> {
     fn from(f: Font) -> Image<T> { Image { data: f.image, width: f.width, height: f.height , format: std::marker::PhantomData::<T>} }
 }
 
+type View<R> = (
+    gfx::handle::RenderTargetView<R, ColorFormat>,
+    gfx::handle::DepthStencilView<R, DepthFormat>
+);
+
 pub struct App<R: gfx::Resources, B: gfx::Backend> {
-    pso: gfx::PipelineState<R, pipe_w::Meta>,
-    pso_w2: gfx::PipelineState<R, pipe_w2::Meta>,
-    pso_p: gfx::PipelineState<R, pipe_p::Meta>,
-    sampler: gfx::handle::Sampler<R>,
-    invoker: CommandInterpreter<R, Vertex>,
-    views: Vec<(gfx::handle::RenderTargetView<R, ColorFormat>,
-                gfx::handle::DepthStencilView<R, DepthFormat>)>,
-    skinning_buffer: gfx::handle::Buffer<R, Skinning>,
+    world: World<B, Vertex>,
+    views: Vec<View<R>>,
     device: gfx_device_gl::Device,
     graphics_pool: gfx::GraphicsCommandPool<B>,
 
@@ -90,13 +97,11 @@ pub struct App<R: gfx::Resources, B: gfx::Backend> {
 }
 
 impl App<gfx_device_gl::Resources, gfx_device_gl::Backend> {
-
     pub fn new(
         window: glutin::GlWindow,
         width: u32,
         height: u32,
     ) -> App<gfx_device_gl::Resources, gfx_device_gl::Backend> {
-        use gfx::traits::DeviceExt;
         use gfx::Device;
 
         let (mut surface, adapters) = gfx_window_glutin::Window::new(window).get_surface_and_adapters();
@@ -114,8 +119,7 @@ impl App<gfx_device_gl::Resources, gfx_device_gl::Backend> {
             .with_depth_stencil::<DepthFormat>();
         let mut swap_chain = surface.build_swapchain(config, &graphics_queue);
 
-        let views: Vec<(gfx::handle::RenderTargetView<_, ColorFormat>,
-                        gfx::handle::DepthStencilView<_, DepthFormat>)> = swap_chain
+        let views: Vec<_> = swap_chain
             .get_backbuffers()
             .iter()
             .map(|&(ref color, ref ds)| {
@@ -138,7 +142,135 @@ impl App<gfx_device_gl::Resources, gfx_device_gl::Backend> {
                 (Typed::new(rtv), Typed::new(dsv))
             }).collect();
 
+        let graphics_pool = graphics_queue.create_graphics_pool(1);
+            
+        let world = World::new(
+            &mut device,
+            (width as f32) / (height as f32),
+        );
 
+        let frame_semaphore = device.create_semaphore();
+        let draw_semaphore = device.create_semaphore();
+        let frame_fence = device.create_fence(false);
+
+        App {
+            device,
+            world,
+            frame_semaphore,
+            draw_semaphore,
+            frame_fence,
+            graphics_pool,
+            swap_chain,
+            graphics_queue,
+            views,
+        }
+    }
+
+    pub fn handle_input(&mut self, ev :glutin::WindowEvent) {
+        self.world.handle_input(ev)
+    }
+
+    fn pre_render(&mut self) {
+        self.world.execute_all_commands()
+    }
+
+    pub fn render(&mut self) {
+        self.pre_render();
+
+        let frame = self.swap_chain.acquire_frame(FrameSync::Semaphore(&self.frame_semaphore));
+        let view = self.views[frame.id()].clone();
+        {
+            let mut encoder = self.graphics_pool.acquire_graphics_encoder();
+
+            encoder.clear(&view.0.clone(), CLEAR_COLOR);
+            encoder.clear_depth(&view.1.clone(), 1.0);
+
+            self.world.render(&view, &mut encoder, &mut self.device);
+
+            encoder.synced_flush(&mut self.graphics_queue, &[&self.frame_semaphore], &[&self.draw_semaphore], Some(&self.frame_fence))
+                .expect("Colud not flush encoder");
+        }
+        self.swap_chain.present(&mut self.graphics_queue, &[&self.draw_semaphore]);
+        self.device.wait_for_fences(&[&self.frame_fence], gfx::WaitFor::All, 1_000_000);
+        self.graphics_queue.cleanup();
+        self.graphics_pool.reset();
+    }
+}
+
+
+enum AvatorCommand {
+    Move (Vector3<f32>),
+}
+enum CameraCommand {
+    Move (Vector3<f32>),
+    LookAt (Point3<f32>),
+}
+enum SystemCommand {
+    Exit
+}
+
+trait Command<T> {
+    fn get_level(&self) -> Level;
+    fn execute(&self, &mut T);
+}
+
+
+struct Invoker<Cmd, T> {
+    commands: Vec<Cmd>,
+    target: T,
+    current_index: usize,
+}
+
+struct System {
+    timer: coarsetime::Instant,
+}
+
+struct World<B: gfx::Backend, V> 
+{
+    camera: Invoker<CameraCommand, Camera<f32>>,
+    avators: Invoker<AvatorCommand, HashMap<i32, Object<B::Resources, V>>>,
+    system: Invoker<SystemCommand, System>,
+    sampler: gfx::handle::Sampler<B::Resources>,
+
+    pso: gfx::PipelineState<B::Resources, pipe_w::Meta>,
+    pso_w2: gfx::PipelineState<B::Resources, pipe_w2::Meta>,
+    pso_p: gfx::PipelineState<B::Resources, pipe_p::Meta>,
+}
+
+fn open_connection() -> Connection {
+    Connection::open(&Path::new("file.db")).expect("failed to open sqlite file")
+}
+
+impl<B: gfx::Backend> World<B, Vertex> 
+{
+    fn new<D: gfx::Device<B::Resources>>(
+        device: &mut D,
+        aspect: f32,
+    ) -> Self {
+        use gfx::traits::DeviceExt;
+
+        let conn = open_connection();
+
+        let avators = Invoker::<AvatorCommand, HashMap<i32, Object<B::Resources, _>>>::new(
+            query_entry::<B::Resources, D, TextureFormat>(&conn, device, &[1,2]).unwrap()
+        );
+        let camera = Invoker::<CameraCommand, Camera<f32>>::new(
+            Camera::new(
+                Point3::new(30.0, -40.0, 30.0),
+                Point3::new(0.0, 0.0, 0.0),
+                cgmath::PerspectiveFov {
+                    fovy: cgmath::Rad(16.0f32.to_radians()),
+                    aspect,
+                    near: 5.0,
+                    far: 1000.0,
+            })
+        );
+        let sampler = {
+            let sampler_info = gfx::texture::SamplerInfo::new(
+                gfx::texture::FilterMethod::Trilinear,
+                gfx::texture::WrapMode::Clamp);
+            device.create_sampler(sampler_info)
+        };
         let pso = {
             let shaders = device.create_shader_set(
           b"#version 150 core
@@ -203,6 +335,7 @@ impl App<gfx_device_gl::Resources, gfx_device_gl::Backend> {
                 pipe_w::new()
                 ).expect("failed to create pipeline w")
         };
+
         let pso_w2 = {
             let shaders = device.create_shader_set(b"
             #version 150 core
@@ -281,239 +414,111 @@ impl App<gfx_device_gl::Resources, gfx_device_gl::Backend> {
                 pipe_p::new()
                 ).expect("failed to create pipeline p")
         };
-
-        let graphics_pool = graphics_queue.create_graphics_pool(1);
-            
-        let sampler = {
-            let sampler_info = gfx::texture::SamplerInfo::new(
-                gfx::texture::FilterMethod::Trilinear,
-                gfx::texture::WrapMode::Clamp);
-            device.create_sampler(sampler_info)
-        };
-        
-        let skinning_buffer = device.create_constant_buffer::<Skinning>(64);
-        let invoker = CommandInterpreter::new(
-            &mut device,
-            (width as f32) / (height as f32)
-        );
-
-        let frame_semaphore = device.create_semaphore();
-        let draw_semaphore = device.create_semaphore();
-        let frame_fence = device.create_fence(false);
-
-        App {
-            device,
+ 
+        World {
+            avators,
+            camera, 
+            system: Invoker::<SystemCommand, System>::new(System {
+                timer: coarsetime::Instant::now()
+            }),
             sampler,
             pso,
             pso_w2,
             pso_p,
-            skinning_buffer,
-            invoker,
-            frame_semaphore,
-            draw_semaphore,
-            frame_fence,
-            graphics_pool,
-            swap_chain,
-            graphics_queue,
-            views,
         }
     }
-
-    pub fn handle_input(&mut self, ev :glutin::WindowEvent) {
-        self.invoker.handle_input(ev)
-    }
-
-    fn pre_render(&mut self) {
-        self.invoker.execute_all_commands()
-    }
-
-    pub fn render(&mut self) {
-        self.pre_render();
-
-        let elapsed = self.invoker.system.target.timer.elapsed().as_f64();
-
-        let sampler = &mut self.sampler;
-
-        let frame = self.swap_chain.acquire_frame(FrameSync::Semaphore(&self.frame_semaphore));
-        let view = self.views[frame.id()].clone();
-        {
-            let mut encoder = self.graphics_pool.acquire_graphics_encoder();
-
-            encoder.clear(&view.0.clone(), CLEAR_COLOR);
-            encoder.clear_depth(&view.1.clone(), 1.0);
-
-
-            for obj in self.invoker.target().values() {
-                let camera = self.invoker.camera(); 
-                let mv = camera.view * Matrix4::from_translation(obj.position.to_vec());
-                let mvp = camera.perspective * mv;
-                {
-                    let a = obj.get_skinning(elapsed);
-                    encoder.update_buffer(&self.skinning_buffer, &a[..], 0).expect("ub");
-                }
-                for entry in &obj.entries {
-                    let data = pipe_w::Data {
-                        vbuf: entry.vertex_buffer.clone(),
-                        u_model_view_proj: mvp.into(),
-                        u_model_view: mv.into(),
-                        u_light: [0.2, 0.2, -0.2f32],
-                        u_ambient_color: [0.01, 0.01, 0.01, 1.0],
-                        u_eye_direction: camera.direction().into(),
-                        u_texture: (entry.texture.clone(), sampler.clone()),
-                        out_color: view.0.clone(),
-                        out_depth: view.1.clone(),
-                        b_skinning: self.skinning_buffer.raw().clone(),
-                    };
-                    encoder.draw(&entry.slice, &self.pso, &data);
-                }
-            }
-            {
-                let camera = self.invoker.camera(); 
-                let font_entry = font_entry(&mut self.device, &format!("{:?}", elapsed)).expect("fe");
-
-                let data = pipe_w2::Data {
-                    vbuf: font_entry.vertex_buffer.clone(),
-                    u_model_view_proj: camera.projection.into(),
-                    u_model_view: camera.view.into(),
-                    u_light: [1.0, 0.5, -0.5f32],
-                    u_ambient_color: [0.00, 0.00, 0.01, 0.4],
-                    u_eye_direction: camera.direction().into(),
-                    u_texture: (font_entry.texture.clone(), sampler.clone()),
-                    out_color: view.0.clone(),
-                    out_depth: view.1.clone()
-                };
-                encoder.draw(&font_entry.slice, &self.pso_w2, &data);
-            }
-            encoder.synced_flush(&mut self.graphics_queue, &[&self.frame_semaphore], &[&self.draw_semaphore], Some(&self.frame_fence))
-                .expect("Colud not flush encoder");
-        }
-        self.swap_chain.present(&mut self.graphics_queue, &[&self.draw_semaphore]);
-        self.device.wait_for_fences(&[&self.frame_fence], gfx::WaitFor::All, 1_000_000);
-        self.graphics_queue.cleanup();
-        self.graphics_pool.reset();
-    }
-}
-
-
-enum AvatorCommand {
-    Move (Vector3<f32>),
-}
-enum CameraCommand {
-    Move (Vector3<f32>),
-    // LookTo (Vector3<f32>),
-}
-enum SystemCommand {
-    Exit
-}
-
-trait Command<T> {
-    fn get_level(&self) -> Level;
-    fn execute(&self, &mut T);
-}
-
-
-struct Invoker<Cmd, T> {
-    commands: Vec<Cmd>,
-    target: T,
-    current_index: usize,
-}
-
-struct System {
-    timer: coarsetime::Instant,
-}
-
-struct CommandInterpreter<R: gfx::Resources, V> {
-    camera: Invoker<CameraCommand, Camera<f32>>,
-    avators: Invoker<AvatorCommand, HashMap<i32, Object<R, V>>>,
-    system: Invoker<SystemCommand, System>,
-}
-
-impl<R: gfx::Resources> CommandInterpreter<R, Vertex> {
-    fn new<F: gfx::Device<R>>(device: &mut F, aspect: f32) -> Self {
-        let conn = Connection::open(&Path::new("file.db")).expect("failed to open sqlite file");
-        CommandInterpreter {
-            avators: Invoker::<AvatorCommand, HashMap<i32, Object<R, _>>>::new(
-                        query_entry::<R, F>(&conn, device, &[1,2]).unwrap()),
-            camera: Invoker::<CameraCommand, Camera<f32>>::new(
-                        Camera::new(
-                            Point3::new(30.0, -40.0, 30.0),
-                            Point3::new(0.0, 0.0, 0.0),
-                            cgmath::PerspectiveFov {
-                                fovy: cgmath::Rad(16.0f32.to_radians()),
-                                aspect: aspect,  
-                                near: 5.0,
-                                far: 1000.0,
-                        })
-                ) , 
-            system: Invoker::<SystemCommand, System>::new(System {
-                timer: coarsetime::Instant::now()
-            })
-        }
-    }
-    fn target(&self) -> &HashMap<i32, Object<R, Vertex>> {
+    fn target(&self) -> &HashMap<i32, Object<B::Resources, Vertex>> {
         &self.avators.target
     }
     fn camera(&self) -> &Camera<f32> {
         &self.camera.target
     }
-    fn handle_input(&mut self, ev: glutin::WindowEvent) {
-        match ev {
-                glutin::WindowEvent::KeyboardInput {
-                    input: glutin::KeyboardInput {
-                        state: glutin::ElementState::Pressed,
-                        virtual_keycode: Some(glutin::VirtualKeyCode::L), ..
-                    }, ..
-                } => self.avators.append_command(AvatorCommand::Move(Vector3::new(0.5,0.0,0.0))),
-                glutin::WindowEvent::KeyboardInput {
-                    input: glutin::KeyboardInput {
-                        state: glutin::ElementState::Pressed,
-                        virtual_keycode: Some(glutin::VirtualKeyCode::H), ..
-                    }, ..
-                } => self.avators.append_command(AvatorCommand::Move(Vector3::new(-0.5,0.0,0.0))),
-                glutin::WindowEvent::KeyboardInput {
-                    input: glutin::KeyboardInput {
-                        state: glutin::ElementState::Pressed,
-                        virtual_keycode: Some(glutin::VirtualKeyCode::J), ..
-                    }, ..
-                } => self.avators.append_command(AvatorCommand::Move(Vector3::new(0.0,-0.5,0.0))),
-                glutin::WindowEvent::KeyboardInput {
-                    input: glutin::KeyboardInput {
-                        state: glutin::ElementState::Pressed,
-                        virtual_keycode: Some(glutin::VirtualKeyCode::K), ..
-                    }, ..
-                } => self.avators.append_command(AvatorCommand::Move(Vector3::new(0.0,0.5,0.0))),
-                glutin::WindowEvent::KeyboardInput {
-                    input: glutin::KeyboardInput {
-                        state: glutin::ElementState::Pressed,
-                        virtual_keycode: Some(glutin::VirtualKeyCode::W), ..
-                    }, ..
-                } => self.camera.append_command(CameraCommand::Move(Vector3::new(0.0, 0.1, 0.0))),
-                glutin::WindowEvent::KeyboardInput {
-                    input: glutin::KeyboardInput {
-                        state: glutin::ElementState::Pressed,
-                        virtual_keycode: Some(glutin::VirtualKeyCode::S), ..
-                    }, ..
-                } => self.camera.append_command(CameraCommand::Move(Vector3::new(0.0, -0.1, 0.0))),
-                glutin::WindowEvent::KeyboardInput {
-                    input: glutin::KeyboardInput {
-                        state: glutin::ElementState::Pressed,
-                        virtual_keycode: Some(glutin::VirtualKeyCode::A), ..
-                    }, ..
-                } => self.camera.append_command(CameraCommand::Move(Vector3::new(-0.1, 0.0, 0.0))),
-                glutin::WindowEvent::KeyboardInput {
-                    input: glutin::KeyboardInput {
-                        state: glutin::ElementState::Pressed,
-                        virtual_keycode: Some(glutin::VirtualKeyCode::D), ..
-                    }, ..
-                } => self.camera.append_command(CameraCommand::Move(Vector3::new(0.1, 0.0, 0.0))),
-                // glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::Z)) 
-                //     => Some(GameCommand::CameraMove(Vector3::new(0.0,0.5,0.0))),
-                // glutin::Event::KeyboardInput(glutin::ElementState::Pressed, _, Some(glutin::VirtualKeyCode::X)) 
-                //     => Some(GameCommand::CameraMove(Vector3::new(0.0,-0.5,0.0))),
-                _   => { }
+    fn render<D: gfx::Device<B::Resources>>(&mut self, view: &View<B::Resources>, encoder: &mut gfx::GraphicsEncoder<B>, device: &mut D) {
+        let elapsed = self.system.target.timer.elapsed().as_f64();
+
+        let camera = self.camera(); 
+        for obj in self.avators.target.values() {
+            obj.render(view, camera, elapsed, &self.pso, encoder,  &self.sampler, device);
+        }
+
+        {
+            let font_entry = font_entry(device, &format!("{:?}", elapsed)).expect("fe");
+
+            let data = pipe_w2::Data {
+                vbuf: font_entry.vertex_buffer,
+                u_model_view_proj: camera.projection.into(),
+                u_model_view: camera.view.into(),
+                u_light: [1.0, 0.5, -0.5f32],
+                u_ambient_color: [0.00, 0.00, 0.01, 0.4],
+                u_eye_direction: camera.direction().into(),
+                u_texture: (font_entry.texture, self.sampler.clone()),
+                out_color: view.0.clone(),
+                out_depth: view.1.clone()
+            };
+            encoder.draw(&font_entry.slice, &self.pso_w2, &data);
         }
     }
 
+    fn handle_input(&mut self, ev: glutin::WindowEvent) {
+        match ev {
+            glutin::WindowEvent::KeyboardInput {
+                input: glutin::KeyboardInput {
+                    state: glutin::ElementState::Pressed,
+                    virtual_keycode: Some(glutin::VirtualKeyCode::L), ..
+                }, ..
+            } => self.avators.append_command(AvatorCommand::Move(Vector3::new(0.5,0.0,0.0))),
+            glutin::WindowEvent::KeyboardInput {
+                input: glutin::KeyboardInput {
+                    state: glutin::ElementState::Pressed,
+                    virtual_keycode: Some(glutin::VirtualKeyCode::H), ..
+                }, ..
+            } => self.avators.append_command(AvatorCommand::Move(Vector3::new(-0.5,0.0,0.0))),
+            glutin::WindowEvent::KeyboardInput {
+                input: glutin::KeyboardInput {
+                    state: glutin::ElementState::Pressed,
+                    virtual_keycode: Some(glutin::VirtualKeyCode::J), ..
+                }, ..
+            } => self.avators.append_command(AvatorCommand::Move(Vector3::new(0.0,-0.5,0.0))),
+            glutin::WindowEvent::KeyboardInput {
+                input: glutin::KeyboardInput {
+                    state: glutin::ElementState::Pressed,
+                    virtual_keycode: Some(glutin::VirtualKeyCode::K), ..
+                }, ..
+            } => self.avators.append_command(AvatorCommand::Move(Vector3::new(0.0,0.5,0.0))),
+            glutin::WindowEvent::KeyboardInput {
+                input: glutin::KeyboardInput {
+                    state: glutin::ElementState::Pressed,
+                    virtual_keycode: Some(glutin::VirtualKeyCode::W), ..
+                }, ..
+            } => self.camera.append_command(CameraCommand::Move(Vector3::new(0.0, 0.1, 0.0))),
+            glutin::WindowEvent::KeyboardInput {
+                input: glutin::KeyboardInput {
+                    state: glutin::ElementState::Pressed,
+                    virtual_keycode: Some(glutin::VirtualKeyCode::S), ..
+                }, ..
+            } => self.camera.append_command(CameraCommand::Move(Vector3::new(0.0, -0.1, 0.0))),
+            glutin::WindowEvent::KeyboardInput {
+                input: glutin::KeyboardInput {
+                    state: glutin::ElementState::Pressed,
+                    virtual_keycode: Some(glutin::VirtualKeyCode::A), ..
+                }, ..
+            } => self.camera.append_command(CameraCommand::Move(Vector3::new(-0.1, 0.0, 0.0))),
+            glutin::WindowEvent::KeyboardInput {
+                input: glutin::KeyboardInput {
+                    state: glutin::ElementState::Pressed,
+                    virtual_keycode: Some(glutin::VirtualKeyCode::D), ..
+                }, ..
+            } => self.camera.append_command(CameraCommand::Move(Vector3::new(0.1, 0.0, 0.0))),
+            glutin::WindowEvent::AxisMotion {
+                axis,
+                value,
+                ..
+            } => {
+                println!("axis motion {}: {}", axis, value);
+            },
+            _   => { }
+        }
+    }
     fn execute_all_commands(&mut self) {
         self.avators.execute_all_commands();
         self.camera.execute_all_commands();
@@ -566,11 +571,18 @@ impl Command<Camera<f32>> for CameraCommand {
                 c.translate(v); 
                 c.update();
             },
+            CameraCommand::LookAt(v) => {
+                c.look_at(v);
+                c.update();
+            }
         }
     }
 }
 
-impl<R: gfx::Resources, V> Command<Object<R, V>> for AvatorCommand {
+impl<R, V> Command<Object<R, V>> for AvatorCommand 
+    where 
+        R: gfx::Resources,
+{
     fn get_level(&self) -> Level {
         Level::Avator
     }
@@ -582,7 +594,10 @@ impl<R: gfx::Resources, V> Command<Object<R, V>> for AvatorCommand {
         }
     }
 }
-impl<R: gfx::Resources, V> Command<HashMap<i32, Object<R, V>>> for AvatorCommand {
+impl<R, V> Command<HashMap<i32, Object<R, V>>> for AvatorCommand 
+    where 
+        R: gfx::Resources,
+{
     fn get_level(&self) -> Level {
         Level::Avator
     }
@@ -671,24 +686,23 @@ impl<T: cgmath::BaseFloat> Camera<T> {
                                     target,
                                     Vector3::new(Zero::zero(), Zero::zero(), One::one()));
         let perspective = Matrix4::from(perspective);
+
         Camera {
-            position: position,
-            target: target,
-            view: view,
-            perspective: perspective,
+            position,
+            target,
+            view,
+            perspective,
             projection: perspective * view
         }
     }
-    fn look_to(&mut self, target: Point3<T>) {
+    fn look_at(&mut self, target: Point3<T>) {
         self.target = target;
     }
     fn direction(& self) -> Vector3<T> {
         self.target - self.position
     }
     fn update(&mut self) {
-        self.view = Matrix4::look_at(self.position,
-                                     self.target,
-                                     Vector3::new(Zero::zero(), Zero::zero(), One::one()));
+        self.view = Matrix4::look_at(self.position, self.target, Vector3::new(Zero::zero(), Zero::zero(), One::one()));
         self.projection = self.perspective * self.view;
     }
 }
@@ -707,7 +721,10 @@ impl Default for Vertex {
 
 const CLEAR_COLOR: [f32; 4] = [0.1, 0.2, 0.3, 1.0];
 
-pub struct Entry<R: gfx::Resources, V, View> {
+pub struct Entry<R, V, View>
+    where 
+        R: gfx::Resources,
+{
     slice: gfx::Slice<R>,
     vertex_buffer: gfx::handle::Buffer<R, V>,
     texture: gfx::handle::ShaderResourceView<R, View>
@@ -729,35 +746,52 @@ struct Animation {
     pose: Matrix4<f32>,
 }
 
-fn entry<R: gfx::Resources, F: gfx::Device<R>, V, T: gfx::format::TextureFormat>(device: &mut F, vertex_data: &[V], img: Image<T>) -> Entry<R, V, T::View> 
-where V: gfx::traits::Pod + gfx::pso::buffer::Structure<gfx::format::Format> {
+fn entry<R, F, V, T> (device: &mut F, vertex_data: &[V], img: Image<T>) -> Entry<R, V, T::View> 
+    where 
+        R: gfx::Resources,
+        F: gfx::Device<R>,
+        V: gfx::traits::Pod + gfx::pso::buffer::Structure<gfx::format::Format>,
+        T: gfx::format::TextureFormat,
+{
     let index_data: Vec<u32> = vertex_data.iter().enumerate().map(|(i, _)| i as u32).collect();
     entry_(device, &vertex_data, &index_data[..], img)
 }
 
-
-fn entry_<R: gfx::Resources, F: gfx::Device<R>, V, T: gfx::format::TextureFormat>(device: &mut F, vertex_data: &[V], index_data: &[u32], img: Image<T>) -> Entry<R, V, T::View> 
-where V: gfx::traits::Pod + gfx::pso::buffer::Structure<gfx::format::Format> {
+fn entry_<R, F, V, T>(device: &mut F, vertex_data: &[V], index_data: &[u32], img: Image<T>) -> Entry<R, V, T::View> 
+    where 
+        R: gfx::Resources,
+        F: gfx::Device<R>,
+        V: gfx::traits::Pod + gfx::pso::buffer::Structure<gfx::format::Format>,
+        T: gfx::format::TextureFormat,
+{
     use gfx::traits::DeviceExt;
     let (vbuf, slice) = device.create_vertex_buffer_with_slice(&vertex_data, index_data);
 
     let tex_kind = gfx::texture::Kind::D2(img.width, img.height, gfx::texture::AaMode::Single);
-    let (_, view) = device.create_texture_immutable_u8::<T>(tex_kind, &[&img.data]).expect("create texture failure");
+    let (_, view) = device.create_texture_immutable_u8::<T>(tex_kind, &[&img.data]).expect("failed to create texture");
 
     Entry {
-        slice: slice,
+        slice,
         vertex_buffer: vbuf,
         texture: view
     }
 }
 
-fn font_entry<R: gfx::Resources, F: gfx::Device<R>>(device: &mut F, text: &str) -> Result<Entry<R, Vertex, f32>,FontError> {
+fn font_entry<R, D>(device: &mut D, text: &str) -> Result<Entry<R, Vertex, f32>,FontError> 
+    where
+        R: gfx::Resources,
+        D: gfx::Device<R>,
+{
     let chars: Vec<char> = "雑に文字描画abcdef0123456789.+-_".chars().map(|c| c).collect();
     Font::from_path("assets/VL-PGothic-Regular.ttf", 8, Some(&chars[..]))
     .and_then(|font| Ok(font_entry_(device, font, text)))
 }
 
-fn font_entry_<R: gfx::Resources, F: gfx::Device<R>>(device: &mut F, font: Font, text: &str) -> Entry<R, Vertex, f32>  {
+fn font_entry_<R, D>(device: &mut D, font: Font, text: &str) -> Entry<R, Vertex, f32> 
+    where
+        R: gfx::Resources,
+        D: gfx::Device<R>,
+{
     let mut vertex_data = Vec::new();
     let mut index_data = Vec::new();
 
@@ -814,39 +848,52 @@ fn font_entry_<R: gfx::Resources, F: gfx::Device<R>>(device: &mut F, font: Font,
 
         x += ch_info.x_advance as f32;
     }
-    entry_(device,
-           vertex_data.as_slice(), index_data.as_slice(),
-           Image::<(gfx::format::R8, gfx::format::Unorm)>::from(font))
+    entry_(
+        device,
+        vertex_data.as_slice(),
+        index_data.as_slice(),
+        Image::<(gfx::format::R8, gfx::format::Unorm)>::from(font)
+    )
 }
 
-fn query_entry<R: gfx::Resources, F: gfx::Device<R>>(conn: &Connection, device: &mut F, ids: &[i32]) -> RusqliteResult<HashMap<i32, Object<R, Vertex>>> {
+fn query_entry<R, D, T> (
+    conn: &Connection,
+    device: &mut D,
+    ids: &[i32]
+) -> RusqliteResult<HashMap<i32, Object<R, Vertex>>> 
+    where
+        R: gfx::Resources,
+        D: gfx::Device<R>,
+        T: gfx::format::TextureFormat,
+{
+    use gfx::traits::DeviceExt;
+
     let mut result = HashMap::default();
 
     for id in ids {
-        let mut entries = Vec::new();
         let meshes = query_mesh(&conn, id)?;
         let joints = query_skeleton(&conn, id)?;
         let animations = query_animation(&conn, id)?;
-        for r in meshes
-        {
-            let vertex_data = r.0;
-            let texture_id = r.1;
+        let entries = meshes.iter().map(|&(ref vertex_data, texture_id)| {
+            let img = query_texture::<TextureFormat>(&conn, texture_id).expect("failed to create texture");
+            entry(device, vertex_data.as_slice(), img)
+        }).collect();
 
-            let img = query_texture(&conn, texture_id).unwrap();
+        let skinning_buffer = device.create_constant_buffer::<Skinning>(64);
 
-            entries.push(
-                entry(device, vertex_data.as_slice(), img)
-                );
-        }
-        result.insert(id.clone(), 
-                      Object {
-                          entries: entries,
-                          position: Point3::new(0.0, 0.0, 0.0),
-                          // front: Vector3::new(0.0, -1.0, 0.0)
-                          joints: joints,
-                          animations: animations
-                      });
+        result.insert(
+            id.clone(), 
+            Object {
+                entries,
+                position: Point3::new(0.0, 0.0, 0.0),
+                // front: Vector3::new(0.0, -1.0, 0.0)
+                joints,
+                animations,
+                skinning_buffer,
+            }
+        );
     }
+
     Ok(result)
 }
 
@@ -856,20 +903,80 @@ struct Object<R: gfx::Resources, V> {
     // front: Vector3<f32>,
     joints: Vec<Joint>,
     animations: Vec<Vec<(f32, Animation)>>,
+
+    skinning_buffer: gfx::handle::Buffer<R, Skinning>,
 }
 
 trait Translate<T: cgmath::BaseFloat> {
     fn translate(&mut self, v: Vector3<T>);
 }
 
-impl<R: gfx::Resources, V> Translate<f32> for Object<R, V>{
+impl<R: gfx::Resources, V> Translate<f32> for Object<R, V>
+{
     fn translate(&mut self, v: Vector3<f32>) {
         self.position += v;
     }
 }
-impl<T: cgmath::BaseFloat> Translate<T> for Camera<T> {
+impl<T: cgmath::BaseFloat> Translate<T> for Camera<T> 
+{
     fn translate(&mut self, v: Vector3<T>) {
         self.position += v;
+    }
+}
+
+trait GraphicsComponent<B: gfx::Backend, D: gfx::Device<B::Resources>> 
+{
+    type PSO;
+
+    fn render(
+        &self,
+        view: &View<B::Resources>,
+        camera: &Camera<f32>,
+        elapsed: f64,
+        pso: &Self::PSO,
+        encoder: &mut gfx::GraphicsEncoder<B>,
+        sampler: &gfx::handle::Sampler<B::Resources>,
+        dievice: &mut D,
+    );
+}
+
+impl<B, D> GraphicsComponent<B, D> for Object<B::Resources, Vertex> 
+    where 
+        B: gfx::Backend,
+        D: gfx::Device<B::Resources>,
+{
+    type PSO = gfx::PipelineState<B::Resources, pipe_w::Meta>;
+    fn render(
+        &self,
+        view: &View<B::Resources>,
+        camera: &Camera<f32>,
+        elapsed: f64,
+        pso: &Self::PSO,
+        encoder: &mut gfx::GraphicsEncoder<B>,
+        sampler: &gfx::handle::Sampler<B::Resources>,
+        _:  &mut D,
+    ) {
+        let mv = camera.view * Matrix4::from_translation(self.position.to_vec());
+        let mvp = camera.perspective * mv;
+        {
+            let a = self.get_skinning(elapsed);
+            encoder.update_buffer(&self.skinning_buffer, &a[..], 0).expect("ub");
+        }
+        for entry in &self.entries {
+            let data = pipe_w::Data {
+                vbuf: entry.vertex_buffer.clone(),
+                u_model_view_proj: mvp.into(),
+                u_model_view: mv.into(),
+                u_light: [0.2, 0.2, -0.2f32],
+                u_ambient_color: [0.01, 0.01, 0.01, 1.0],
+                u_eye_direction: camera.direction().into(),
+                u_texture: (entry.texture.clone(), sampler.clone()),
+                out_color: view.0.clone(),
+                out_depth: view.1.clone(),
+                b_skinning: self.skinning_buffer.raw().clone(),
+            };
+            encoder.draw(&entry.slice, pso, &data);
+        }
     }
 }
 
@@ -889,34 +996,36 @@ impl<R: gfx::Resources, V> Object<R, V> {
                     Some(v) => {
                         let length = v.len();
 
-                        let output = p * if length > 0 {
-                            let duration = 4.0;
-                            let sample_per_second = length as f32 / duration; 
-                            let t = (time as f32 % duration) * sample_per_second;
+                        let transform = (
+                            p * if length > 0 {
+                                let duration = 4.0;
+                                let sample_per_second = length as f32 / duration; 
+                                let t = (time as f32 % duration) * sample_per_second;
 
-                            let index_1 = t.floor() as usize;
-                            let ceiled = t.ceil() as usize;
-                            let index_2 = if ceiled == length { 0 } else { ceiled };
+                                let index_1 = t.floor() as usize;
+                                let ceiled = t.ceil() as usize;
+                                let index_2 = if ceiled == length { 0 } else { ceiled };
 
-                            let blend_factor = t - index_1 as f32;
+                                let blend_factor = t - index_1 as f32;
 
-                            let sample_1 = &v[index_1];
-                            let sample_2 = &v[index_2];
+                                let sample_1 = &v[index_1];
+                                let sample_2 = &v[index_2];
 
-                            let pose_1: Matrix4<f32> = sample_1.1.pose;
-                            let pose_2: Matrix4<f32> = sample_2.1.pose;
+                                let pose_1: Matrix4<f32> = sample_1.1.pose;
+                                let pose_2: Matrix4<f32> = sample_2.1.pose;
 
-                            let pose = pose_1 + (pose_2 - pose_1) * blend_factor;
+                                let pose = pose_1 + (pose_2 - pose_1) * blend_factor;
 
-                            local.insert(j.joint_index as usize, p * pose);
-                            pose * j.inverse
-                        } else {
-                            local.insert(j.joint_index as usize, j.bind);
-                            j.bind 
-                        };
+                                local.insert(j.joint_index as usize, p * pose);
+                                pose * j.inverse
+                            } else {
+                                local.insert(j.joint_index as usize, j.bind);
+                                j.bind 
+                            }
+                        ).into();
 
                         Skinning{ 
-                            transform: output.into()
+                            transform,
                         }
                     },
                     _ => {
@@ -985,7 +1094,6 @@ impl<R: gfx::Resources, V> Object<R, V> {
             vec!({Skinning{ transform: identity.into()}})
         }
     }
-
 }
 
 
@@ -1056,7 +1164,10 @@ Order By MV.ObjectId, MV.MeshId, MV.IndexNo
     Ok(meshes)
 }
 
-fn query_texture(conn: &Connection, texture_id: i32) -> RusqliteResult<Image<ColorFormat>> {
+fn query_texture<T>(conn: &Connection, texture_id: i32) -> RusqliteResult<Image<T>> 
+    where 
+        T: gfx::format::TextureFormat
+{
     conn.query_row("
 SELECT 
   T.Width
@@ -1069,7 +1180,7 @@ WHERE T.TextureId = ?1
             data: r.get::<&str, Vec<u8>>("Data"),
             width: r.get::<&str, i32>("Width") as u16, 
             height: r.get::<&str, i32>("Height") as u16,
-            format: std::marker::PhantomData::<ColorFormat>
+            format: std::marker::PhantomData::<T>
         }
     })
 }
@@ -1157,17 +1268,17 @@ ORDER BY JointIndex
     let mut joints = Vec::<Joint>::with_capacity(255);
     for r in result
     {
-        let (inx, p, bind, inverse) = r?;
+        let (joint_index, parent, bind, inverse) = r?;
 
         let joint = Joint {
-            joint_index: inx,
+            joint_index,
             global: bind,
-            bind: bind,
-            parent: p,
-            inverse : inverse,
+            bind,
+            parent,
+            inverse,
         };
 
-        joints.insert(inx as usize, joint);
+        joints.insert(joint_index as usize, joint);
     }
     Ok(joints)
 }
@@ -1198,12 +1309,13 @@ SELECT
     Name        
   FROM Animation AS A
 WHERE A.ObjectId = ?1
-Order By JointIndex
+  AND JointIndex <> 0
+Order By JointIndex, SampleTime
 ")?;
     let result = stmt.query_map(&[object_id], |r| {
         ( r.get::<&str,i32>("AnimationId"),
           r.get::<&str,i32>("JointIndex"),
-          r.get::<&str,f64>("SampleTime"),
+          r.get::<&str,f64>("SampleTime") as f32,
           Matrix4::new(r.get::<&str,f64>("SamplePose11") as f32,
                        r.get::<&str,f64>("SamplePose12") as f32,
                        r.get::<&str,f64>("SamplePose13") as f32,
@@ -1226,7 +1338,8 @@ Order By JointIndex
     let mut animations = Vec::<Vec<(f32, Animation)>>::with_capacity(255);
     for r in result
     {
-        let (_, joint_index, time, pose) = r?;
+        let (id, joint_index, time, pose) = r?;
+        println!("{}: {} {}", id, joint_index, time);
 
         if joint_index >= 0 {
             (|t: (f32, Animation) | {
@@ -1238,11 +1351,11 @@ Order By JointIndex
                     }
                     animations.insert(joint_index as usize, vec!(t)); 
                 }
-            })((time as f32,
+            })((time,
                 Animation {
-                    joint_index: joint_index,
-                    time: time as f32,
-                    pose : pose,
+                    joint_index,
+                    time,
+                    pose,
                 })
               );
         }
@@ -1374,7 +1487,7 @@ impl Font {
         Ok(Font{
             width: image_width as u16,
             height: image_height as u16,
-            image: image,
+            image,
             chars: chars_info
         })
     }
