@@ -7,18 +7,18 @@ extern crate rusqlite;
 extern crate fnv;
 extern crate coarsetime;
 extern crate gfx_device_gl;
-
 extern crate freetype;
+
+mod models;
+mod font;
 
 use rusqlite::Connection;
 use rusqlite::Error as RusqliteError;
 use std::path::Path;
 use fnv::FnvHashMap as HashMap;
-use fnv::FnvHashSet as HashSet;
 
-use freetype as ft;
-use freetype::Error as FreetypeError;
-use freetype::Face;
+use models::*;
+use font::*;
 
 use gfx::{
     Adapter,
@@ -35,7 +35,6 @@ use gfx::format::Formatted;
 
 pub type ColorFormat = gfx::format::Srgba8;
 pub type DepthFormat = gfx::format::DepthStencil;
-
 type TextureFormat = ColorFormat;
 
 use cgmath::{
@@ -47,34 +46,19 @@ use cgmath::{
     Zero,
 };
 
-type FontResult = Result<Font, FontError>;
-type RusqliteResult<T> = Result<T, RusqliteError>;
-
-
 #[derive(Debug)]
 pub enum AppError {
     RusqliteError(RusqliteError),
     FontError(FontError)
 }
 
-#[derive(Debug)]
-pub enum FontError {
-    FreetypeError(FreetypeError),
-    EmptyFont
-}
-
-impl From<FreetypeError> for FontError {
-    fn from(e: FreetypeError) -> FontError { FontError::FreetypeError(e) }
-}
 impl From<RusqliteError> for AppError {
     fn from(e: RusqliteError) -> AppError { AppError::RusqliteError(e) }
 }
 impl From<FontError> for AppError {
     fn from(e: FontError) -> AppError { AppError::FontError(e) }
 }
-impl<T: gfx::format::TextureFormat> From<Font> for Image<T> {
-    fn from(f: Font) -> Image<T> { Image { data: f.image, width: f.width, height: f.height , format: std::marker::PhantomData::<T>} }
-}
+
 
 type View<R> = (
     gfx::handle::RenderTargetView<R, ColorFormat>,
@@ -97,7 +81,7 @@ pub struct App<R: gfx::Resources, B: gfx::Backend> {
 }
 
 impl App<gfx_device_gl::Resources, gfx_device_gl::Backend> {
-    pub fn new(
+    pub fn new (
         window: glutin::GlWindow,
         width: u32,
         height: u32,
@@ -214,7 +198,6 @@ trait Command<T> {
     fn execute(&self, &mut T);
 }
 
-
 struct Invoker<Cmd, T> {
     commands: Vec<Cmd>,
     target: T,
@@ -225,25 +208,35 @@ struct System {
     timer: coarsetime::Instant,
 }
 
-struct World<B: gfx::Backend, V> 
-{
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum WorldState {
+    Render,
+    Pose,
+}
+
+struct World<B: gfx::Backend, V> {
     camera: Invoker<CameraCommand, Camera<f32>>,
-    avators: Invoker<AvatorCommand, HashMap<i32, Object<B::Resources, V>>>,
+    avators: Invoker<AvatorCommand, HashMap<i32, GameObject<B::Resources, V>>>,
     system: Invoker<SystemCommand, System>,
     sampler: gfx::handle::Sampler<B::Resources>,
 
     pso: gfx::PipelineState<B::Resources, pipe_w::Meta>,
     pso_w2: gfx::PipelineState<B::Resources, pipe_w2::Meta>,
     pso_p: gfx::PipelineState<B::Resources, pipe_p::Meta>,
+    pso_pt: gfx::PipelineState<B::Resources, pipe_pt::Meta>,
+
+    font: Font,
+
+    state: WorldState,
 }
 
 fn open_connection() -> Connection {
     Connection::open(&Path::new("file.db")).expect("failed to open sqlite file")
 }
 
-impl<B: gfx::Backend> World<B, Vertex> 
-{
-    fn new<D: gfx::Device<B::Resources>>(
+impl<B: gfx::Backend> World<B, Vertex> {
+    fn new<D: gfx::Device<B::Resources>> (
         device: &mut D,
         aspect: f32,
     ) -> Self {
@@ -251,7 +244,7 @@ impl<B: gfx::Backend> World<B, Vertex>
 
         let conn = open_connection();
 
-        let avators = Invoker::<AvatorCommand, HashMap<i32, Object<B::Resources, _>>>::new(
+        let avators = Invoker::<AvatorCommand, HashMap<i32, GameObject<B::Resources, _>>>::new(
             query_entry::<B::Resources, D, TextureFormat>(&conn, device, &[1,2]).unwrap()
         );
         let camera = Invoker::<CameraCommand, Camera<f32>>::new(
@@ -268,7 +261,8 @@ impl<B: gfx::Backend> World<B, Vertex>
         let sampler = {
             let sampler_info = gfx::texture::SamplerInfo::new(
                 gfx::texture::FilterMethod::Trilinear,
-                gfx::texture::WrapMode::Clamp);
+                gfx::texture::WrapMode::Clamp
+            );
             device.create_sampler(sampler_info)
         };
         let pso = {
@@ -286,12 +280,10 @@ impl<B: gfx::Backend> World<B, Vertex>
             in ivec4 joint_indices;
             in vec4 joint_weights;
             
-            
             out vec2 v_TexCoord;
             out vec3 _normal;
             
             void main() {
-            
                 vec4 bindVertex = vec4(position, 1.0);
                 vec4 bindNormal = vec4(normal, 0.0);
                 vec4 v =  joint_weights.x * u_skinning[joint_indices.x] * bindVertex;
@@ -306,8 +298,7 @@ impl<B: gfx::Backend> World<B, Vertex>
                 gl_Position = u_model_view_proj * v;
                 v_TexCoord = uv;
                 _normal = normalize(bindNormal).xyz;
-            }
-            ",
+            }",
           b"#version 150 core
             
             uniform vec3 u_light;
@@ -326,8 +317,7 @@ impl<B: gfx::Backend> World<B, Vertex>
                 vec3 halfLE = normalize(u_eyeDirection);
                 float specular = pow(clamp(dot(_normal, halfLE), 0.0, 1.0), 50.0);
                 Target0 = texColor * vec4(vec3(diffuse), 1.0) + vec4(vec3(specular), 1.0) + u_ambientColor;
-            }
-            ").expect("shader exists?");
+            }").expect("failed to build shader");
             device.create_pipeline_state(
                 &shaders,
                 gfx::Primitive::TriangleList,
@@ -345,6 +335,8 @@ impl<B: gfx::Backend> World<B, Vertex>
             
             in vec3 position, normal;
             in vec2 uv;
+            in vec4 color;
+            out vec4 v_Color;
             
             out vec2 v_TexCoord;
             out vec3 _normal;
@@ -354,6 +346,7 @@ impl<B: gfx::Backend> World<B, Vertex>
             
                 gl_Position = u_model_view_proj * vec4(position, 1.0);
                 _normal = normalize(normal);
+                v_Color = color;
             }
             ",
             b"
@@ -366,6 +359,8 @@ impl<B: gfx::Backend> World<B, Vertex>
             
             in vec2 v_TexCoord;
             in vec3 _normal;
+            in vec4 v_Color;
+ 
             out vec4 Target0;
             
             void main() {
@@ -374,16 +369,14 @@ impl<B: gfx::Backend> World<B, Vertex>
                 float diffuse = clamp(dot(_normal, -u_light), 0.05f, 1.0f);
                 vec3 halfLE = normalize(u_eyeDirection);
                 float specular = pow(clamp(dot(_normal, halfLE), 0.0, 1.0), 50.0);
-                Target0 = texColor * vec4(vec3(diffuse), 1.0) + vec4(vec3(specular), 1.0) + u_ambientColor;
-            }
-            ",
-            ).expect("shader exists?");
+                Target0 = vec4(vec3(diffuse) + vec3(specular), texColor.r) + u_ambientColor;
+            }").expect("failed to build shader");
             device.create_pipeline_state(
                 &shaders,
                 gfx::Primitive::TriangleList,
-                gfx::state::Rasterizer::new_fill(),
+                gfx::state::Rasterizer::new_fill().with_cull_back(),
                 pipe_w2::new()
-                ).expect("failed to create pipeline w2")
+            ).expect("failed to create pipeline w2")
         };
         let pso_p = {
             let shaders = device.create_shader_set(b"
@@ -405,15 +398,65 @@ impl<B: gfx::Backend> World<B, Vertex>
             
             void main() {
                 Target0 = v_color;
-            }
-            ").expect("shader error");
+            }").expect("failed to build shader");
             device.create_pipeline_state(
                 &shaders,
-                gfx::Primitive::LineStrip,
+                gfx::Primitive::TriangleStrip,
                 gfx::state::Rasterizer::new_fill().with_cull_back(),
                 pipe_p::new()
                 ).expect("failed to create pipeline p")
         };
+        let pso_pt = {
+            let shaders = device.create_shader_set(b"
+            #version 150 core
+            
+            in vec3 position;
+            in vec2 uv;
+            in vec4 color;
+            out vec2 v_TexCoord;
+            out vec4 v_Color;
+
+            uniform vec2 u_screen_size;
+            
+            void main() {
+                vec2 screenOffset = vec2(
+                    2 * position.x / u_screen_size.x - 1,
+                    2 * position.z / u_screen_size.y - 1
+                );
+                v_TexCoord = vec2(uv.x, uv.y);
+                gl_Position = vec4(screenOffset, 0.0, 1.0);
+                v_Color = color;
+            }
+            ",
+            b"
+            #version 150 core
+
+            uniform sampler2D u_texture;
+            
+            in vec2 v_TexCoord;
+            in vec4 v_Color;
+
+            out vec4 Target0;
+            
+            void main() {
+                vec4 texColor = texture(u_texture, v_TexCoord);
+                Target0 = vec4(v_Color.rgb, texColor.r * v_Color.a);
+            }").expect("failed to build shader");
+            device.create_pipeline_state(
+                &shaders,
+                gfx::Primitive::TriangleList,
+                gfx::state::Rasterizer::new_fill().with_cull_back(),
+                pipe_pt::new()
+            ).expect("failed to create pipeline p")
+        };
+
+        let state = WorldState::Render;
+        let font_chars: Vec<char> = "雑に文字描画abcdef0123456789.+-_".chars().map(|c| c).collect();
+        let font = Font::from_path(
+            "assets/VL-PGothic-Regular.ttf",
+            24,
+            Some(font_chars.as_slice())
+        ).expect("failed to create font");
  
         World {
             avators,
@@ -425,24 +468,25 @@ impl<B: gfx::Backend> World<B, Vertex>
             pso,
             pso_w2,
             pso_p,
+            pso_pt,
+            font,
+
+            state,
         }
-    }
-    fn target(&self) -> &HashMap<i32, Object<B::Resources, Vertex>> {
-        &self.avators.target
     }
     fn camera(&self) -> &Camera<f32> {
         &self.camera.target
     }
     fn render<D: gfx::Device<B::Resources>>(&mut self, view: &View<B::Resources>, encoder: &mut gfx::GraphicsEncoder<B>, device: &mut D) {
+        use gfx::traits::DeviceExt;
         let elapsed = self.system.target.timer.elapsed().as_f64();
 
         let camera = self.camera(); 
         for obj in self.avators.target.values() {
             obj.render(view, camera, elapsed, &self.pso, encoder,  &self.sampler, device);
         }
-
         {
-            let font_entry = font_entry(device, &format!("{:?}", elapsed)).expect("fe");
+            let font_entry = font_entry(device, &self.font, &format!("{:?}", elapsed), [0.0, 0.0], [0.0;4], 0.2);
 
             let data = pipe_w2::Data {
                 vbuf: font_entry.vertex_buffer,
@@ -456,6 +500,50 @@ impl<B: gfx::Backend> World<B, Vertex>
                 out_depth: view.1.clone()
             };
             encoder.draw(&font_entry.slice, &self.pso_w2, &data);
+        }
+        if self.state == WorldState::Pose {
+            let vertex_data = vec!(
+                VertexP {
+                    position: [-0.95, 0.0, 0.0],
+                    color: [0.03, 0.03, 0.03, 0.9],
+                }, 
+                VertexP {
+                    position: [0.95, 0.0, 0.0],
+                    color: [0.03, 0.03, 0.03, 0.9],
+                },
+                VertexP {
+                    position: [-0.95, -0.95, 0.0],
+                    color: [0.03, 0.03, 0.03, 1.0],
+                },
+                VertexP {
+                    position: [0.95,  -0.95, 0.0],
+                    color: [0.03, 0.03, 0.03, 1.0],
+                },
+            );
+            {
+                let (vbuf, slice) = device.create_vertex_buffer_with_slice(&vertex_data, &[1u32, 0u32, 2u32, 3u32, 1u32][..]);
+                let data = pipe_p::Data {
+                    vbuf: vbuf,
+                    out_color: view.0.clone(),
+                    out_depth: view.1.clone(),
+                };
+                encoder.draw(&slice, &self.pso_p, &data);
+            }
+            {
+                let font_entry = font_entry(device, &self.font, &format!("abc0"), [0.0, 0.0], [0.5,0.2, 0.0, 1.0], 10.0);
+
+                let data = pipe_pt::Data {
+                    vbuf: font_entry.vertex_buffer,
+                    u_texture: (font_entry.texture, self.sampler.clone()),
+                    out_color: view.0.clone(),
+                    out_depth: view.1.clone(),
+                    screen_size: {
+                        let (w, h, _, _) = view.0.get_dimensions();
+                        [w as f32, h as f32]
+                    },
+                };
+                encoder.draw(&font_entry.slice, &self.pso_pt, &data);
+            }
         }
     }
 
@@ -509,6 +597,12 @@ impl<B: gfx::Backend> World<B, Vertex>
                     virtual_keycode: Some(glutin::VirtualKeyCode::D), ..
                 }, ..
             } => self.camera.append_command(CameraCommand::Move(Vector3::new(0.1, 0.0, 0.0))),
+            glutin::WindowEvent::KeyboardInput {
+                input: glutin::KeyboardInput {
+                    state: glutin::ElementState::Pressed,
+                    virtual_keycode: Some(glutin::VirtualKeyCode::M), ..
+                }, ..
+            } => self.state = if self.state == WorldState::Render { WorldState::Pose } else { WorldState::Render } , 
             glutin::WindowEvent::AxisMotion {
                 axis,
                 value,
@@ -579,14 +673,11 @@ impl Command<Camera<f32>> for CameraCommand {
     }
 }
 
-impl<R, V> Command<Object<R, V>> for AvatorCommand 
-    where 
-        R: gfx::Resources,
-{
+impl<R: gfx::Resources, V> Command<GameObject<R, V>> for AvatorCommand {
     fn get_level(&self) -> Level {
         Level::Avator
     }
-    fn execute(&self, c: &mut Object<R, V>) {
+    fn execute(&self, c: &mut GameObject<R, V>) {
         match *self {
             AvatorCommand::Move(v) => {
                 c.translate(v); 
@@ -594,14 +685,11 @@ impl<R, V> Command<Object<R, V>> for AvatorCommand
         }
     }
 }
-impl<R, V> Command<HashMap<i32, Object<R, V>>> for AvatorCommand 
-    where 
-        R: gfx::Resources,
-{
+impl<R: gfx::Resources, V> Command<HashMap<i32, GameObject<R, V>>> for AvatorCommand {
     fn get_level(&self) -> Level {
         Level::Avator
     }
-    fn execute(&self, c: &mut HashMap<i32, Object<R, V>>) {
+    fn execute(&self, c: &mut HashMap<i32, GameObject<R, V>>) {
         match *self {
             AvatorCommand::Move(v) => {
                 c.get_mut(&1).unwrap().translate(v); 
@@ -616,13 +704,6 @@ enum Level {
     Avator,
     World,
     System,
-}
-
-struct Image<T: gfx::format::TextureFormat> {
-    data: Vec<u8>,
-    width: u16,
-    height: u16,
-    format: std::marker::PhantomData<T>
 }
 
 gfx_defines!{
@@ -644,16 +725,25 @@ gfx_defines!{
         uv: [f32; 2] = "uv",
         joint_indices: [i32; 4] = "joint_indices",
         joint_weights: [f32; 4] = "joint_weights",
+        color: [f32; 4] = "color",
     }
     pipeline pipe_p {
         vbuf: gfx::VertexBuffer<VertexP> = (),
         out_color: gfx::RenderTarget<ColorFormat> = "Target0",
         out_depth: gfx::DepthTarget<DepthFormat> = gfx::preset::depth::LESS_EQUAL_WRITE,
     }
+    pipeline pipe_pt {
+        vbuf: gfx::VertexBuffer<Vertex> = (),
+        out_color: gfx::BlendTarget<ColorFormat> = ("Target0", gfx::state::ColorMask::all(), gfx::preset::blend::ALPHA),
+        out_depth: gfx::DepthTarget<DepthFormat> = gfx::preset::depth::LESS_EQUAL_WRITE,
+        u_texture: gfx::TextureSampler<f32> = "u_texture",
+        screen_size: gfx::Global<[f32; 2]> = "u_screen_size",
+    }
     vertex VertexP {
         position: [f32; 3] = "position",
         color: [f32; 4] = "color",
     }
+
     pipeline pipe_w2 {
         vbuf: gfx::VertexBuffer<Vertex> = (),
         u_model_view_proj: gfx::Global<[[f32; 4]; 4]> = "u_model_view_proj",
@@ -662,7 +752,7 @@ gfx_defines!{
         u_ambient_color: gfx::Global<[f32; 4]> = "u_ambientColor",
         u_eye_direction: gfx::Global<[f32; 3]> = "u_eyeDirection",
         u_texture: gfx::TextureSampler<f32> = "u_texture",
-        out_color: gfx::RenderTarget<ColorFormat> = "Target0",
+        out_color: gfx::BlendTarget<ColorFormat> = ("Target0", gfx::state::ColorMask::all(), gfx::preset::blend::ALPHA),
         out_depth: gfx::DepthTarget<DepthFormat> = gfx::preset::depth::LESS_EQUAL_WRITE,
     }
     constant Skinning {
@@ -714,39 +804,21 @@ impl Default for Vertex {
             normal: [0.0; 3],
             uv: [0.0; 2],
             joint_indices: [0; 4],
-            joint_weights: [0.0; 4]
+            joint_weights: [0.0; 4],
+            color: [0.0; 4],
         }
     }
 }
 
 const CLEAR_COLOR: [f32; 4] = [0.1, 0.2, 0.3, 1.0];
 
-pub struct Entry<R, V, View>
-    where 
-        R: gfx::Resources,
-{
+pub struct Entry<R: gfx::Resources, V, View> {
     slice: gfx::Slice<R>,
     vertex_buffer: gfx::handle::Buffer<R, V>,
-    texture: gfx::handle::ShaderResourceView<R, View>
+    texture:  gfx::handle::ShaderResourceView<R, View>
 }
 
-#[derive(Debug, Copy, Clone)]
-struct Joint {
-    joint_index: i32,
-    pub global : Matrix4<f32>,
-    bind: Matrix4<f32>,
-    parent: i32,
-    inverse: Matrix4<f32>
-}
-
-#[derive(Debug)]
-struct Animation {
-    joint_index: i32,
-    time: f32,
-    pose: Matrix4<f32>,
-}
-
-fn entry<R, F, V, T> (device: &mut F, vertex_data: &[V], img: Image<T>) -> Entry<R, V, T::View> 
+fn entry<'e, R, F, V, T>(device: &mut F, vertex_data: &[V], img: &'e Image<T>) -> Entry<R, V, T::View> 
     where 
         R: gfx::Resources,
         F: gfx::Device<R>,
@@ -757,7 +829,7 @@ fn entry<R, F, V, T> (device: &mut F, vertex_data: &[V], img: Image<T>) -> Entry
     entry_(device, &vertex_data, &index_data[..], img)
 }
 
-fn entry_<R, F, V, T>(device: &mut F, vertex_data: &[V], index_data: &[u32], img: Image<T>) -> Entry<R, V, T::View> 
+fn entry_<'e, R, F, V, T>(device: &mut F, vertex_data: &[V], index_data: &[u32], img: &'e Image<T>) -> Entry<R, V, T::View> 
     where 
         R: gfx::Resources,
         F: gfx::Device<R>,
@@ -777,25 +849,13 @@ fn entry_<R, F, V, T>(device: &mut F, vertex_data: &[V], index_data: &[u32], img
     }
 }
 
-fn font_entry<R, D>(device: &mut D, text: &str) -> Result<Entry<R, Vertex, f32>,FontError> 
-    where
-        R: gfx::Resources,
-        D: gfx::Device<R>,
-{
-    let chars: Vec<char> = "雑に文字描画abcdef0123456789.+-_".chars().map(|c| c).collect();
-    Font::from_path("assets/VL-PGothic-Regular.ttf", 8, Some(&chars[..]))
-    .and_then(|font| Ok(font_entry_(device, font, text)))
-}
 
-fn font_entry_<R, D>(device: &mut D, font: Font, text: &str) -> Entry<R, Vertex, f32> 
-    where
-        R: gfx::Resources,
-        D: gfx::Device<R>,
+fn font_entry<R: gfx::Resources, D: gfx::Device<R>>(device: &mut D, font: &Font, text: &str, pos: [f32;2], color: [f32;4], scale: f32) -> Entry<R, Vertex, f32> 
 {
     let mut vertex_data = Vec::new();
     let mut index_data = Vec::new();
 
-    let (mut x, z, y) = (0.0, 0.0, 0.0);
+    let (mut x, z, y) = (pos[0], 0.0, pos[1]);
     for ch in text.chars() {
         let ch_info = match font.chars.get(&ch) {
             Some(info) => info,
@@ -809,58 +869,58 @@ fn font_entry_<R, D>(device: &mut D, font: Font, text: &str) -> Entry<R, Vertex,
 
         vertex_data.push(
             Vertex { 
-                position: [x_offset, z, y_offset],
-                normal: [ 0.0, 0.0, 1.0],
+                position: [x_offset * scale, z, y_offset * scale],
+                normal: [0.0, 1.0, 0.0],
                 uv: [tex[0], tex[1] + ch_info.tex_height] ,
-                joint_indices: [0;4], joint_weights: [0.0;4]
+                joint_indices: [0;4], joint_weights: [0.0;4], color 
             }
         );
         vertex_data.push(
             Vertex { 
-                position: [x_offset, z, y_offset + ch_info.height as f32],
-                normal: [ 0.0, 0.0, 1.0],
+                position: [x_offset * scale, z, (y_offset + ch_info.height as f32) * scale],
+                normal: [0.0, 1.0, 0.0],
                 uv: [tex[0], tex[1]], 
-                joint_indices: [0;4], joint_weights: [0.0;4]
+                joint_indices: [0;4], joint_weights: [0.0;4], color
             }
         );
         vertex_data.push(
             Vertex { 
-                position: [x_offset + ch_info.width as f32, z, y_offset + ch_info.height as f32],
-                normal: [0.0, 0.0, 1.0],
+                position: [scale * (x_offset + ch_info.width as f32), z, scale * (y_offset + ch_info.height as f32)],
+                normal: [0.0, 1.0, 0.0],
                 uv: [tex[0] + ch_info.tex_width, tex[1]], 
-                joint_indices: [0;4], joint_weights: [0.0;4]
+                joint_indices: [0;4], joint_weights: [0.0;4], color
             }
         );
         vertex_data.push(
             Vertex { 
-                position: [x_offset + ch_info.width as f32, z, y_offset],
-                normal: [0.0, 0.0, 1.0],
+                position: [scale * (x_offset + ch_info.width as f32), z, scale * y_offset],
+                normal: [0.0, 1.0, 0.0],
                 uv: [tex[0] + ch_info.tex_width, tex[1] + ch_info.tex_height] ,
-                joint_indices: [0;4], joint_weights: [0.0;4]
+                joint_indices: [0;4], joint_weights: [0.0;4], color
             }
         );
-        index_data.push(index + 0);
-        index_data.push(index + 1);
         index_data.push(index + 3);
-        index_data.push(index + 3);
-        index_data.push(index + 1);
         index_data.push(index + 2);
+        index_data.push(index + 1);
+        index_data.push(index + 1);
+        index_data.push(index + 0);
+        index_data.push(index + 3);
 
         x += ch_info.x_advance as f32;
     }
     entry_(
         device,
-        vertex_data.as_slice(),
-        index_data.as_slice(),
-        Image::<(gfx::format::R8, gfx::format::Unorm)>::from(font)
+        &vertex_data,
+        &index_data,
+        &font.texture,
     )
 }
 
 fn query_entry<R, D, T> (
     conn: &Connection,
     device: &mut D,
-    ids: &[i32]
-) -> RusqliteResult<HashMap<i32, Object<R, Vertex>>> 
+    ids: &[i32],
+) -> RusqliteResult<HashMap<i32, GameObject<R, Vertex>>> 
     where
         R: gfx::Resources,
         D: gfx::Device<R>,
@@ -876,14 +936,14 @@ fn query_entry<R, D, T> (
         let animations = query_animation(&conn, id)?;
         let entries = meshes.iter().map(|&(ref vertex_data, texture_id)| {
             let img = query_texture::<TextureFormat>(&conn, texture_id).expect("failed to create texture");
-            entry(device, vertex_data.as_slice(), img)
+            entry(device, vertex_data.as_slice(), &img)
         }).collect();
 
-        let skinning_buffer = device.create_constant_buffer::<Skinning>(64);
+        let skinning_buffer = device.create_constant_buffer(64);
 
         result.insert(
             id.clone(), 
-            Object {
+            GameObject {
                 entries,
                 position: Point3::new(0.0, 0.0, 0.0),
                 // front: Vector3::new(0.0, -1.0, 0.0)
@@ -897,7 +957,7 @@ fn query_entry<R, D, T> (
     Ok(result)
 }
 
-struct Object<R: gfx::Resources, V> {
+struct GameObject<R: gfx::Resources, V> {
     entries: Vec<Entry<R, V, [f32;4]>>,
     position: Point3<f32>,
     // front: Vector3<f32>,
@@ -911,7 +971,7 @@ trait Translate<T: cgmath::BaseFloat> {
     fn translate(&mut self, v: Vector3<T>);
 }
 
-impl<R: gfx::Resources, V> Translate<f32> for Object<R, V>
+impl<R: gfx::Resources, V> Translate<f32> for GameObject<R, V>
 {
     fn translate(&mut self, v: Vector3<f32>) {
         self.position += v;
@@ -940,7 +1000,7 @@ trait GraphicsComponent<B: gfx::Backend, D: gfx::Device<B::Resources>>
     );
 }
 
-impl<B, D> GraphicsComponent<B, D> for Object<B::Resources, Vertex> 
+impl<B, D> GraphicsComponent<B, D> for GameObject<B::Resources, Vertex> 
     where 
         B: gfx::Backend,
         D: gfx::Device<B::Resources>,
@@ -960,7 +1020,7 @@ impl<B, D> GraphicsComponent<B, D> for Object<B::Resources, Vertex>
         let mvp = camera.perspective * mv;
         {
             let a = self.get_skinning(elapsed);
-            encoder.update_buffer(&self.skinning_buffer, &a[..], 0).expect("ub");
+            encoder.update_buffer(&self.skinning_buffer, &a, 0).expect("ub");
         }
         for entry in &self.entries {
             let data = pipe_w::Data {
@@ -980,7 +1040,7 @@ impl<B, D> GraphicsComponent<B, D> for Object<B::Resources, Vertex>
     }
 }
 
-impl<R: gfx::Resources, V> Object<R, V> {
+impl<R: gfx::Resources, V> GameObject<R, V> {
     fn get_skinning(&self, time: f64) -> Vec<Skinning> {
         if self.joints.len() > 0 {
             let mut local = Vec::<Matrix4<f32>>::with_capacity(255);
@@ -1064,7 +1124,6 @@ impl<R: gfx::Resources, V> Object<R, V> {
                             let sample_1 = &v[inx];
 
                             let pose_1: Matrix4<f32> = sample_1.1.pose;
-                            // println!("{}: {} :{}", inx,  sample_1.0);
 
                             let pose = pose_1; 
 
@@ -1146,7 +1205,8 @@ Order By MV.ObjectId, MV.MeshId, MV.IndexNo
               joint_weights: [ r.get::<&str,f64>("JointWeight1") as f32,
                                r.get::<&str,f64>("JointWeight2") as f32,
                                r.get::<&str,f64>("JointWeight3") as f32,
-                               r.get::<&str,f64>("JointWeight4") as f32]
+                               r.get::<&str,f64>("JointWeight4") as f32],
+              color: [0.0;4]
           }
         )
     })?;
@@ -1264,7 +1324,6 @@ ORDER BY JointIndex
         )
     })?;
 
-
     let mut joints = Vec::<Joint>::with_capacity(255);
     for r in result
     {
@@ -1283,227 +1342,7 @@ ORDER BY JointIndex
     Ok(joints)
 }
 
-fn query_animation(conn: &Connection, object_id: &i32) -> RusqliteResult<Vec<Vec<(f32, Animation)>>> {
-    let mut stmt = conn.prepare("
-SELECT
-    AnimationId ,
-    ObjectId    ,
-    JointIndex  ,
-    SampleTime  ,
-    SamplePose11,
-    SamplePose12,
-    SamplePose13,
-    SamplePose14,
-    SamplePose21,
-    SamplePose22,
-    SamplePose23,
-    SamplePose24,
-    SamplePose31,
-    SamplePose32,
-    SamplePose33,
-    SamplePose34,
-    SamplePose41,
-    SamplePose42,
-    SamplePose43,
-    SamplePose44,
-    Name        
-  FROM Animation AS A
-WHERE A.ObjectId = ?1
-  AND JointIndex <> 0
-Order By JointIndex, SampleTime
-")?;
-    let result = stmt.query_map(&[object_id], |r| {
-        ( r.get::<&str,i32>("AnimationId"),
-          r.get::<&str,i32>("JointIndex"),
-          r.get::<&str,f64>("SampleTime") as f32,
-          Matrix4::new(r.get::<&str,f64>("SamplePose11") as f32,
-                       r.get::<&str,f64>("SamplePose12") as f32,
-                       r.get::<&str,f64>("SamplePose13") as f32,
-                       r.get::<&str,f64>("SamplePose14") as f32,
-                       r.get::<&str,f64>("SamplePose21") as f32,
-                       r.get::<&str,f64>("SamplePose22") as f32,
-                       r.get::<&str,f64>("SamplePose23") as f32,
-                       r.get::<&str,f64>("SamplePose24") as f32,
-                       r.get::<&str,f64>("SamplePose31") as f32,
-                       r.get::<&str,f64>("SamplePose32") as f32,
-                       r.get::<&str,f64>("SamplePose33") as f32,
-                       r.get::<&str,f64>("SamplePose34") as f32,
-                       r.get::<&str,f64>("SamplePose41") as f32,
-                       r.get::<&str,f64>("SamplePose42") as f32,
-                       r.get::<&str,f64>("SamplePose43") as f32,
-                       r.get::<&str,f64>("SamplePose44") as f32)
-        )
-    })?;
-
-    let mut animations = Vec::<Vec<(f32, Animation)>>::with_capacity(255);
-    for r in result
-    {
-        let (id, joint_index, time, pose) = r?;
-        println!("{}: {} {}", id, joint_index, time);
-
-        if joint_index >= 0 {
-            (|t: (f32, Animation) | {
-                if match animations.get(joint_index as usize) { Some(_) => true, _ => false } {
-                    animations.get_mut(joint_index as usize).unwrap().push(t);
-                } else {
-                    for i in animations.len() .. joint_index as usize {
-                        animations.insert(i, vec!()); 
-                    }
-                    animations.insert(joint_index as usize, vec!(t)); 
-                }
-            })((time,
-                Animation {
-                    joint_index,
-                    time,
-                    pose,
-                })
-              );
-        }
-    }
-    Ok(animations)
-}
 
 
-pub struct Font {
-    width: u16,
-    height: u16,
-    image: Vec<u8>,
-    chars: HashMap<char, BitmapChar>
-}
 
-struct BitmapChar {
-    pub x_offset: i32,
-    pub y_offset: i32,
-    pub x_advance: i32,
-    pub width: i32,
-    pub height: i32,
-    pub tex: [f32; 2],
-    pub tex_width: f32,
-    pub tex_height: f32,
-    // This field is used only while building the texture.
-    data: Option<Vec<u8>>,
-}
-
-
-impl Font {
-    pub fn from_path(path: &str, font_size: u8, chars: Option<&[char]>) -> FontResult {
-        let library = ft::Library::init()?;
-        let face = library.new_face(path, 0)?;
-        Self::new(face, font_size, chars)
-    }
-    fn new<'a>(mut face: ft::Face<'a>, font_size: u8, chars: Option<&[char]>) -> FontResult {
-        use std::iter::FromIterator;
-        use std::iter::repeat;
-        use std::cmp::max;
-
-        let needed_chars = chars
-            .map(|sl| HashSet::from_iter(sl.iter().cloned()))
-            .unwrap_or_else(|| Self::get_all_face_chars(&mut face));
-        if needed_chars.is_empty() {
-            return Err(FontError::EmptyFont);
-        }
-
-        face.set_pixel_sizes(font_size as u32, font_size as u32)?;
-
-        let mut chars_info = HashMap::default();
-        let mut sum_image_width = 0;
-        let mut max_ch_width = 0;
-        let mut max_ch_height = 0;
-        for ch in needed_chars {
-            try!(face.load_char(ch as usize, ft::face::RENDER));
-
-            let glyph = face.glyph();
-            let bitmap = glyph.bitmap();
-
-            let ch_width = bitmap.width();
-            let ch_height = bitmap.rows();
-
-            chars_info.insert(ch, BitmapChar {
-                x_offset: glyph.bitmap_left(),
-                y_offset: font_size as i32 - glyph.bitmap_top(),
-                x_advance: (glyph.advance().x >> 6) as i32,
-                width: ch_width,
-                height: ch_height,
-                tex: [0.0, 0.0],
-                tex_width: 0.0,
-                tex_height: 0.0,
-                data: Some(Vec::from(bitmap.buffer()))
-            });
-            sum_image_width += ch_width;
-            max_ch_width = max(max_ch_width, ch_width);
-            max_ch_height = max(max_ch_height, ch_height);
-        }
-
-        let ideal_image_size = sum_image_width * max_ch_height;
-        let image_width = {
-            let ideal_image_width = (ideal_image_size as f32).sqrt() as i32;
-            max(max_ch_width, ideal_image_width)
-        };
-        let mut image = Vec::new();
-        let mut chars_row = Vec::new();
-        let dump_row = |image: &mut Vec<u8>, chars_row: &Vec<(i32, i32, Vec<u8>)>| {
-            for i in 0..max_ch_height {
-                let mut x = 0;
-                for &(width, height, ref data) in chars_row {
-                    if i >= height {
-                        image.extend(repeat(0).take(width as usize));
-                    } else {
-                        let skip = i * width;
-                        let line = data.iter().skip(skip as usize).take(width as usize);
-                        image.extend(line.cloned());
-                    };
-                    x += width;
-                }
-                let cols_to_fill = image_width - x;
-                image.extend(repeat(0).take(cols_to_fill as usize));
-            }
-        };
-
-        let mut cursor_x = 0;
-        let mut image_height = 0;
-
-        for (_, ch_info) in chars_info.iter_mut() {
-            if cursor_x + ch_info.width > image_width {
-                dump_row(&mut image, &chars_row);
-                chars_row.clear();
-                cursor_x = 0;
-                image_height += max_ch_height;
-            }
-            let ch_data = ch_info.data.take().unwrap();
-            chars_row.push((ch_info.width, ch_info.height, ch_data));
-            ch_info.tex = [cursor_x as f32, image_height as f32];
-            cursor_x += ch_info.width;
-        }
-        dump_row(&mut image, &chars_row);
-        image_height += max_ch_height;
-
-        for (_, ch_info) in chars_info.iter_mut() {
-            ch_info.tex[0] /= image_width as f32;
-            ch_info.tex[1] /= image_height as f32;
-            ch_info.tex_width = ch_info.width as f32 / image_width as f32;
-            ch_info.tex_height = ch_info.height as f32 / image_height as f32;
-        }
-
-        Ok(Font{
-            width: image_width as u16,
-            height: image_height as u16,
-            image,
-            chars: chars_info
-        })
-    }
-    fn get_all_face_chars<'a>(face: &mut Face<'a>) -> HashSet<char> {
-        use std::char::from_u32;
-        let mut result = HashSet::default();
-        let mut index = 0;
-        let face_ptr = face.raw_mut();
-        unsafe {
-            let mut code = ft::ffi::FT_Get_First_Char(face_ptr, &mut index);
-            while index != 0 {
-                from_u32(code as u32).map(|ch| result.insert(ch));
-                code = ft::ffi::FT_Get_Next_Char(face_ptr, code, &mut index);
-            }
-        }
-        result
-    }
-}
 
