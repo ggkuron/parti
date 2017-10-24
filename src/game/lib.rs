@@ -451,12 +451,14 @@ impl<B: gfx::Backend> World<B, Vertex> {
         };
 
         let state = WorldState::Render;
-        let font_chars: Vec<char> = "雑に文字描画abcdef0123456789.+-_".chars().map(|c| c).collect();
-        let font = Font::from_path(
-            "assets/VL-PGothic-Regular.ttf",
-            24,
-            Some(font_chars.as_slice())
-        ).expect("failed to create font");
+        let font = {
+            let font_chars: Vec<char> = "abcdefghijklmnopqrstuvwxyz0123456789.+-_".chars().map(|c| c).collect();
+            Font::from_path(
+                "assets/VL-PGothic-Regular.ttf",
+                48,
+                Some(font_chars.as_slice())
+            )
+        }.expect("failed to create font");
  
         World {
             avators,
@@ -480,13 +482,14 @@ impl<B: gfx::Backend> World<B, Vertex> {
     fn render<D: gfx::Device<B::Resources>>(&mut self, view: &View<B::Resources>, encoder: &mut gfx::GraphicsEncoder<B>, device: &mut D) {
         use gfx::traits::DeviceExt;
         let elapsed = self.system.target.timer.elapsed().as_f64();
+        let (screen_width, screen_height, _, _) = view.0.get_dimensions();
 
         let camera = self.camera(); 
         for obj in self.avators.target.values() {
             obj.render(view, camera, elapsed, &self.pso, encoder,  &self.sampler, device);
         }
         {
-            let font_entry = font_entry(device, &self.font, &format!("{:?}", elapsed), [0.0, 0.0], [0.0;4], 0.2);
+            let font_entry = font_entry(device, &self.font, &format!("{:?}", elapsed), [0.0, 0.0], [0.0;4], 0.1);
 
             let data = pipe_w2::Data {
                 vbuf: font_entry.vertex_buffer,
@@ -530,7 +533,7 @@ impl<B: gfx::Backend> World<B, Vertex> {
                 encoder.draw(&slice, &self.pso_p, &data);
             }
             {
-                let font_entry = font_entry(device, &self.font, &format!("abc0"), [0.0, 0.0], [0.5,0.2, 0.0, 1.0], 10.0);
+                let font_entry = font_entry(device, &self.font, &format!("abc\n0efg"), [40.0, screen_height as f32 / 2.0], [0.8, 0.8, 0.8, 1.0], 1.0);
 
                 let data = pipe_pt::Data {
                     vbuf: font_entry.vertex_buffer,
@@ -538,8 +541,7 @@ impl<B: gfx::Backend> World<B, Vertex> {
                     out_color: view.0.clone(),
                     out_depth: view.1.clone(),
                     screen_size: {
-                        let (w, h, _, _) = view.0.get_dimensions();
-                        [w as f32, h as f32]
+                        [screen_width as f32, screen_height as f32]
                     },
                 };
                 encoder.draw(&font_entry.slice, &self.pso_pt, &data);
@@ -855,58 +857,68 @@ fn font_entry<R: gfx::Resources, D: gfx::Device<R>>(device: &mut D, font: &Font,
     let mut vertex_data = Vec::new();
     let mut index_data = Vec::new();
 
-    let (mut x, z, y) = (pos[0], 0.0, pos[1]);
-    for ch in text.chars() {
-        let ch_info = match font.chars.get(&ch) {
-            Some(info) => info,
-            None => continue,
-        };
-        let x_offset = x + ch_info.x_offset as f32;
-        let y_offset = y + ch_info.y_offset as f32;
-        let tex = ch_info.tex;
+    let (mut x, z, mut y) = (pos[0], 0.0, pos[1]);
 
-        let index = vertex_data.len() as u32;
+    let mut min_y_end = y as i32;
+    for l in text.split('\n') {
+        for ch in l.chars() {
+            let ch_info = match font.chars.get(&ch) {
+                Some(info) => info,
+                None => continue,
+            };
+            let x_offset = (x + ch_info.x_offset as f32) * scale;
+            let y_offset = (y - ch_info.y_offset as f32) * scale;
+            let tex = ch_info.tex;
+            let x_end = x_offset + ch_info.width as f32 * scale;
+            let y_end = y_offset - ch_info.height as f32 * scale;
+            min_y_end = std::cmp::min(min_y_end, y_end as i32);
 
-        vertex_data.push(
-            Vertex { 
-                position: [x_offset * scale, z, y_offset * scale],
-                normal: [0.0, 1.0, 0.0],
-                uv: [tex[0], tex[1] + ch_info.tex_height] ,
-                joint_indices: [0;4], joint_weights: [0.0;4], color 
-            }
-        );
-        vertex_data.push(
-            Vertex { 
-                position: [x_offset * scale, z, (y_offset + ch_info.height as f32) * scale],
-                normal: [0.0, 1.0, 0.0],
-                uv: [tex[0], tex[1]], 
-                joint_indices: [0;4], joint_weights: [0.0;4], color
-            }
-        );
-        vertex_data.push(
-            Vertex { 
-                position: [scale * (x_offset + ch_info.width as f32), z, scale * (y_offset + ch_info.height as f32)],
-                normal: [0.0, 1.0, 0.0],
-                uv: [tex[0] + ch_info.tex_width, tex[1]], 
-                joint_indices: [0;4], joint_weights: [0.0;4], color
-            }
-        );
-        vertex_data.push(
-            Vertex { 
-                position: [scale * (x_offset + ch_info.width as f32), z, scale * y_offset],
-                normal: [0.0, 1.0, 0.0],
-                uv: [tex[0] + ch_info.tex_width, tex[1] + ch_info.tex_height] ,
-                joint_indices: [0;4], joint_weights: [0.0;4], color
-            }
-        );
-        index_data.push(index + 3);
-        index_data.push(index + 2);
-        index_data.push(index + 1);
-        index_data.push(index + 1);
-        index_data.push(index + 0);
-        index_data.push(index + 3);
+            let index = vertex_data.len() as u32;
 
-        x += ch_info.x_advance as f32;
+            vertex_data.push(
+                Vertex { 
+                    position: [x_offset, z, y_offset],
+                    normal: [0.0, 1.0, 0.0],
+                    uv: [tex[0], tex[1]] ,
+                    joint_indices: [0;4], joint_weights: [0.0;4], color 
+                }
+            );
+            vertex_data.push(
+                Vertex { 
+                    position: [x_offset, z, y_end],
+                    normal: [0.0, 1.0, 0.0],
+                    uv: [tex[0], tex[1] + ch_info.tex_height], 
+                    joint_indices: [0;4], joint_weights: [0.0;4], color
+                }
+            );
+            vertex_data.push(
+                Vertex { 
+                    position: [x_end, z, y_end],
+                    normal: [0.0, 1.0, 0.0],
+                    uv: [tex[0] + ch_info.tex_width, tex[1] + ch_info.tex_height], 
+                    joint_indices: [0;4], joint_weights: [0.0;4], color
+                }
+            );
+            vertex_data.push(
+                Vertex { 
+                    position: [x_end, z, y_offset],
+                    normal: [0.0, 1.0, 0.0],
+                    uv: [tex[0] + ch_info.tex_width, tex[1]] ,
+                    joint_indices: [0;4], joint_weights: [0.0;4], color
+                }
+            );
+            index_data.push(index + 0);
+            index_data.push(index + 1);
+            index_data.push(index + 3);
+            index_data.push(index + 3);
+            index_data.push(index + 1);
+            index_data.push(index + 2);
+
+            x += ch_info.x_advance as f32;
+        }
+        x = pos[0];
+        y = min_y_end as f32;
+        min_y_end = pos[1] as i32;
     }
     entry_(
         device,
