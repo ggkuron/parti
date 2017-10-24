@@ -229,6 +229,7 @@ struct World<B: gfx::Backend, V> {
     font: Font,
 
     state: WorldState,
+    time: f64,
 }
 
 fn open_connection() -> Connection {
@@ -474,36 +475,22 @@ impl<B: gfx::Backend> World<B, Vertex> {
             font,
 
             state,
+            time: 0.0,
         }
     }
     fn camera(&self) -> &Camera<f32> {
         &self.camera.target
     }
+    fn update(&mut self) {
+        if self.state != WorldState::Pose {
+            self.time = self.system.target.timer.elapsed().as_f64();
+        } 
+    }
     fn render<D: gfx::Device<B::Resources>>(&mut self, view: &View<B::Resources>, encoder: &mut gfx::GraphicsEncoder<B>, device: &mut D) {
         use gfx::traits::DeviceExt;
-        let elapsed = self.system.target.timer.elapsed().as_f64();
+        self.update();
         let (screen_width, screen_height, _, _) = view.0.get_dimensions();
 
-        let camera = self.camera(); 
-        for obj in self.avators.target.values() {
-            obj.render(view, camera, elapsed, &self.pso, encoder,  &self.sampler, device);
-        }
-        {
-            let font_entry = font_entry(device, &self.font, &format!("{:?}", elapsed), [0.0, 0.0], [0.0;4], 0.1);
-
-            let data = pipe_w2::Data {
-                vbuf: font_entry.vertex_buffer,
-                u_model_view_proj: camera.projection.into(),
-                u_model_view: camera.view.into(),
-                u_light: [1.0, 0.5, -0.5f32],
-                u_ambient_color: [0.00, 0.00, 0.01, 0.4],
-                u_eye_direction: camera.direction().into(),
-                u_texture: (font_entry.texture, self.sampler.clone()),
-                out_color: view.0.clone(),
-                out_depth: view.1.clone()
-            };
-            encoder.draw(&font_entry.slice, &self.pso_w2, &data);
-        }
         if self.state == WorldState::Pose {
             let vertex_data = vec!(
                 VertexP {
@@ -547,6 +534,28 @@ impl<B: gfx::Backend> World<B, Vertex> {
                 encoder.draw(&font_entry.slice, &self.pso_pt, &data);
             }
         }
+
+        let camera = self.camera(); 
+        for obj in self.avators.target.values() {
+            obj.render(view, camera, self.time, &self.pso, encoder,  &self.sampler, device);
+        }
+        {
+            let font_entry = font_entry(device, &self.font, &format!("{:?}", &self.time), [0.0, 0.0], [0.0;4], 0.1);
+
+            let data = pipe_w2::Data {
+                vbuf: font_entry.vertex_buffer,
+                u_model_view_proj: camera.projection.into(),
+                u_model_view: camera.view.into(),
+                u_light: [1.0, 0.5, -0.5f32],
+                u_ambient_color: [0.00, 0.00, 0.01, 0.4],
+                u_eye_direction: camera.direction().into(),
+                u_texture: (font_entry.texture, self.sampler.clone()),
+                out_color: view.0.clone(),
+                out_depth: view.1.clone()
+            };
+            encoder.draw(&font_entry.slice, &self.pso_w2, &data);
+        }
+
     }
 
     fn handle_input(&mut self, ev: glutin::WindowEvent) {
@@ -1058,10 +1067,11 @@ impl<R: gfx::Resources, V> GameObject<R, V> {
             let mut local = Vec::<Matrix4<f32>>::with_capacity(255);
             self.joints.iter().map(|j| {
 
-                let p = if j.parent == 255 {
-                    cgmath::One::one()
-                } else { 
-                    *local.get(j.parent as usize).unwrap()
+                let p = match local.get(j.parent as usize) {
+                    Some(p) => { *p },
+                    _ => {
+                        cgmath::One::one()
+                    }
                 };
            
                 match self.animations.get(j.joint_index as usize) {
