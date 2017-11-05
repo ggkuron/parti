@@ -8,6 +8,7 @@ extern crate fnv;
 extern crate coarsetime;
 extern crate gfx_device_gl;
 extern crate freetype;
+extern crate gilrs;
 
 mod models;
 mod font;
@@ -46,6 +47,13 @@ use cgmath::{
     Zero,
 };
 
+use gilrs::{
+    Gilrs,
+    Button,
+    Axis,
+    Event
+};
+
 #[derive(Debug)]
 pub enum AppError {
     RusqliteError(RusqliteError),
@@ -78,6 +86,8 @@ pub struct App<R: gfx::Resources, B: gfx::Backend> {
 
     frame_fence: gfx::handle::Fence<R>,
     graphics_queue: gfx::queue::GraphicsQueue<B>,
+
+    gilrs: Gilrs,
 }
 
 impl App<gfx_device_gl::Resources, gfx_device_gl::Backend> {
@@ -137,6 +147,8 @@ impl App<gfx_device_gl::Resources, gfx_device_gl::Backend> {
         let draw_semaphore = device.create_semaphore();
         let frame_fence = device.create_fence(false);
 
+        let gilrs = Gilrs::new();
+
         App {
             device,
             world,
@@ -147,6 +159,7 @@ impl App<gfx_device_gl::Resources, gfx_device_gl::Backend> {
             swap_chain,
             graphics_queue,
             views,
+            gilrs
         }
     }
 
@@ -155,6 +168,45 @@ impl App<gfx_device_gl::Resources, gfx_device_gl::Backend> {
     }
 
     fn pre_render(&mut self) {
+        while let Some(ev) = self.gilrs.next_event() {
+            self.gilrs.update(&ev);
+            let id = ev.id;
+            match ev.event {
+                gilrs::EventType::Connected => {
+                    println!("connected {}", id);
+                },
+                gilrs::EventType::Disconnected => {
+                    println!("disconnected {}", id);
+                },
+                _ => {}
+            }
+        }
+
+        {
+            let pad = &self.gilrs[0];
+
+            if pad.is_pressed(Button::DPadUp) {
+                self.world.avators.append_command(AvatorCommand::Move(Vector3::new(0.0,-0.5,0.0)))
+            }
+            if pad.is_pressed(Button::DPadDown) {
+                self.world.avators.append_command(AvatorCommand::Move(Vector3::new(0.0,0.5,0.0)))
+            }
+            if pad.is_pressed(Button::DPadLeft) {
+                self.world.avators.append_command(AvatorCommand::Move(Vector3::new(-0.5,0.0,0.0)))
+            }
+            if pad.is_pressed(Button::DPadRight) {
+                self.world.avators.append_command(AvatorCommand::Move(Vector3::new(0.5,0.0,0.0)))
+            }
+            if pad.is_pressed(Button::Start) {
+                self.world.system.append_command(SystemCommand::ModeChange());
+            }
+            let x = pad.value(Axis::LeftStickX);
+            let y = pad.value(Axis::LeftStickY);
+            self.world.avators.append_command(AvatorCommand::Move(Vector3::new(x, 0.0, 0.0)));
+            self.world.avators.append_command(AvatorCommand::Move(Vector3::new(0.0, y, 0.0)));
+        }
+
+        self.gilrs.inc();
         self.world.execute_all_commands()
     }
 
@@ -183,14 +235,15 @@ impl App<gfx_device_gl::Resources, gfx_device_gl::Backend> {
 
 
 enum AvatorCommand {
-    Move (Vector3<f32>),
+    Move(Vector3<f32>),
 }
 enum CameraCommand {
-    Move (Vector3<f32>),
+    Move(Vector3<f32>),
     LookAt (Point3<f32>),
 }
 enum SystemCommand {
-    Exit
+    Exit,
+    ModeChange(),
 }
 
 trait Command<T> {
@@ -206,6 +259,25 @@ struct Invoker<Cmd, T> {
 
 struct System {
     timer: coarsetime::Instant,
+    state: WorldState,
+    font: Font,
+}
+
+impl System {
+    fn new() -> Self {
+        System {
+            timer: coarsetime::Instant::now(),
+            state: WorldState::Render,
+            font : {
+                let font_chars: Vec<char> = "abcdefghijklmnopqrstuvwxyz0123456789.+-_".chars().map(|c| c).collect();
+                Font::from_path(
+                    "assets/VL-PGothic-Regular.ttf",
+                    48,
+                    Some(font_chars.as_slice())
+                )
+            }.expect("failed to create font")
+        }
+    }
 }
 
 
@@ -228,7 +300,6 @@ struct World<B: gfx::Backend, V> {
 
     font: Font,
 
-    state: WorldState,
     time: f64,
 }
 
@@ -396,16 +467,26 @@ impl<B: gfx::Backend> World<B, Vertex> {
             #version 150 core
             in vec4 v_color;
             out vec4 Target0;
+
+            uniform vec2 u_screen_size;
+            uniform vec2 u_cursor;
             
             void main() {
-                Target0 = v_color;
+                if (gl_FragCoord.x > u_screen_size.x - 120
+                    && gl_FragCoord.x < u_screen_size.x - 40
+                    && gl_FragCoord.y > 40
+                    && gl_FragCoord.y < 120) {
+                    Target0 = vec4(1.0, 1.0, 0.0, 1.0);
+                } else {
+                    Target0 = v_color;
+                }
             }").expect("failed to build shader");
             device.create_pipeline_state(
                 &shaders,
                 gfx::Primitive::TriangleStrip,
                 gfx::state::Rasterizer::new_fill().with_cull_back(),
                 pipe_p::new()
-                ).expect("failed to create pipeline p")
+            ).expect("failed to create pipeline p")
         };
         let pso_pt = {
             let shaders = device.create_shader_set(b"
@@ -424,7 +505,7 @@ impl<B: gfx::Backend> World<B, Vertex> {
                     2 * position.x / u_screen_size.x - 1,
                     2 * position.z / u_screen_size.y - 1
                 );
-                v_TexCoord = vec2(uv.x, uv.y);
+                v_TexCoord = uv;
                 gl_Position = vec4(screenOffset, 0.0, 1.0);
                 v_Color = color;
             }
@@ -451,7 +532,6 @@ impl<B: gfx::Backend> World<B, Vertex> {
             ).expect("failed to create pipeline p")
         };
 
-        let state = WorldState::Render;
         let font = {
             let font_chars: Vec<char> = "abcdefghijklmnopqrstuvwxyz0123456789.+-_".chars().map(|c| c).collect();
             Font::from_path(
@@ -464,17 +544,13 @@ impl<B: gfx::Backend> World<B, Vertex> {
         World {
             avators,
             camera, 
-            system: Invoker::<SystemCommand, System>::new(System {
-                timer: coarsetime::Instant::now()
-            }),
+            system: Invoker::<SystemCommand, System>::new(System::new()),
             sampler,
             pso,
-            pso_w2,
             pso_p,
+            pso_w2,
             pso_pt,
             font,
-
-            state,
             time: 0.0,
         }
     }
@@ -482,62 +558,30 @@ impl<B: gfx::Backend> World<B, Vertex> {
         &self.camera.target
     }
     fn update(&mut self) {
-        if self.state != WorldState::Pose {
+        if self.system.target.state != WorldState::Pose {
             self.time = self.system.target.timer.elapsed().as_f64();
         } 
     }
     fn render<D: gfx::Device<B::Resources>>(&mut self, view: &View<B::Resources>, encoder: &mut gfx::GraphicsEncoder<B>, device: &mut D) {
-        use gfx::traits::DeviceExt;
         self.update();
+
         let (screen_width, screen_height, _, _) = view.0.get_dimensions();
+        let screen_size = {
+            [screen_width as f32, screen_height as f32]
+        };
 
-        if self.state == WorldState::Pose {
-            let vertex_data = vec!(
-                VertexP {
-                    position: [-0.95, 0.0, 0.0],
-                    color: [0.03, 0.03, 0.03, 0.9],
-                }, 
-                VertexP {
-                    position: [0.95, 0.0, 0.0],
-                    color: [0.03, 0.03, 0.03, 0.9],
-                },
-                VertexP {
-                    position: [-0.95, -0.95, 0.0],
-                    color: [0.03, 0.03, 0.03, 1.0],
-                },
-                VertexP {
-                    position: [0.95,  -0.95, 0.0],
-                    color: [0.03, 0.03, 0.03, 1.0],
-                },
+        if self.system.target.state == WorldState::Pose {
+            self.system.target.render(
+                view, self.camera(), self.time, &self.pso_p, encoder, &self.sampler, device, screen_size
             );
-            {
-                let (vbuf, slice) = device.create_vertex_buffer_with_slice(&vertex_data, &[1u32, 0u32, 2u32, 3u32, 1u32][..]);
-                let data = pipe_p::Data {
-                    vbuf: vbuf,
-                    out_color: view.0.clone(),
-                    out_depth: view.1.clone(),
-                };
-                encoder.draw(&slice, &self.pso_p, &data);
-            }
-            {
-                let font_entry = font_entry(device, &self.font, &format!("abc\n0efg"), [40.0, screen_height as f32 / 2.0], [0.8, 0.8, 0.8, 1.0], 1.0);
-
-                let data = pipe_pt::Data {
-                    vbuf: font_entry.vertex_buffer,
-                    u_texture: (font_entry.texture, self.sampler.clone()),
-                    out_color: view.0.clone(),
-                    out_depth: view.1.clone(),
-                    screen_size: {
-                        [screen_width as f32, screen_height as f32]
-                    },
-                };
-                encoder.draw(&font_entry.slice, &self.pso_pt, &data);
-            }
+            self.system.target.render(
+                view, self.camera(), self.time, &self.pso_pt, encoder, &self.sampler, device, screen_size
+            );
         }
 
         let camera = self.camera(); 
         for obj in self.avators.target.values() {
-            obj.render(view, camera, self.time, &self.pso, encoder,  &self.sampler, device);
+            obj.render(view, camera, self.time, &self.pso, encoder,  &self.sampler, device, screen_size);
         }
         {
             let font_entry = font_entry(device, &self.font, &format!("{:?}", &self.time), [0.0, 0.0], [0.0;4], 0.1);
@@ -559,6 +603,7 @@ impl<B: gfx::Backend> World<B, Vertex> {
     }
 
     fn handle_input(&mut self, ev: glutin::WindowEvent) {
+
         match ev {
             glutin::WindowEvent::KeyboardInput {
                 input: glutin::KeyboardInput {
@@ -613,7 +658,7 @@ impl<B: gfx::Backend> World<B, Vertex> {
                     state: glutin::ElementState::Pressed,
                     virtual_keycode: Some(glutin::VirtualKeyCode::M), ..
                 }, ..
-            } => self.state = if self.state == WorldState::Render { WorldState::Pose } else { WorldState::Render } , 
+            } => self.system.append_command(SystemCommand::ModeChange()) , 
             glutin::WindowEvent::AxisMotion {
                 axis,
                 value,
@@ -625,6 +670,7 @@ impl<B: gfx::Backend> World<B, Vertex> {
         }
     }
     fn execute_all_commands(&mut self) {
+        self.system.execute_all_commands();
         self.avators.execute_all_commands();
         self.camera.execute_all_commands();
     }
@@ -665,6 +711,24 @@ impl<Cmd, T> Invoker<Cmd, T>
     }
 }
 
+impl Command<System> for SystemCommand {
+    fn get_level(&self) -> Level {
+        Level::System
+    }
+    fn execute(&self, sys: &mut System) {
+        match *self {
+            SystemCommand::ModeChange() => {
+                sys.state = if sys.state == WorldState::Render {
+                    WorldState::Pose
+                } else { 
+                    WorldState::Render 
+                };
+            },
+            SystemCommand::Exit => {
+            }
+        }
+    }
+}
 
 impl Command<Camera<f32>> for CameraCommand {
     fn get_level(&self) -> Level {
@@ -742,6 +806,8 @@ gfx_defines!{
         vbuf: gfx::VertexBuffer<VertexP> = (),
         out_color: gfx::RenderTarget<ColorFormat> = "Target0",
         out_depth: gfx::DepthTarget<DepthFormat> = gfx::preset::depth::LESS_EQUAL_WRITE,
+        screen_size: gfx::Global<[f32; 2]> = "u_screen_size",
+        cursor: gfx::Global<[f32; 2]> = "u_cursor",
     }
     pipeline pipe_pt {
         vbuf: gfx::VertexBuffer<Vertex> = (),
@@ -974,7 +1040,6 @@ fn query_entry<R, D, T> (
             }
         );
     }
-
     Ok(result)
 }
 
@@ -1005,37 +1070,117 @@ impl<T: cgmath::BaseFloat> Translate<T> for Camera<T>
     }
 }
 
-trait GraphicsComponent<B: gfx::Backend, D: gfx::Device<B::Resources>> 
+trait GraphicsComponent<
+    B: gfx::Backend,
+    D: gfx::Device<B::Resources>,
+    PSO
+> 
 {
-    type PSO;
-
     fn render(
         &self,
         view: &View<B::Resources>,
         camera: &Camera<f32>,
-        elapsed: f64,
-        pso: &Self::PSO,
+        _: f64,
+        pso: &PSO,
         encoder: &mut gfx::GraphicsEncoder<B>,
         sampler: &gfx::handle::Sampler<B::Resources>,
         dievice: &mut D,
+        screen_size: [f32; 2],
     );
 }
 
-impl<B, D> GraphicsComponent<B, D> for GameObject<B::Resources, Vertex> 
-    where 
-        B: gfx::Backend,
-        D: gfx::Device<B::Resources>,
+impl<B, D> 
+    GraphicsComponent<B, D, gfx::PipelineState<B::Resources, pipe_p::Meta>>
+    for System 
+where B: gfx::Backend, D: gfx::Device<B::Resources>, 
 {
-    type PSO = gfx::PipelineState<B::Resources, pipe_w::Meta>;
+    fn render(
+        &self,
+        view: &View<B::Resources>,
+        camera: &Camera<f32>,
+        _: f64,
+        pso: &gfx::PipelineState<B::Resources, pipe_p::Meta>,
+        encoder: &mut gfx::GraphicsEncoder<B>,
+        _: &gfx::handle::Sampler<B::Resources>,
+        device :  &mut D,
+        screen_size: [f32; 2],
+    ) {
+        use gfx::traits::DeviceExt;
+        let vertex_data = vec!(
+            VertexP {
+                position: [-0.95, 0.0, 0.0],
+                color: [0.03, 0.03, 0.03, 0.9],
+            }, 
+            VertexP {
+                position: [0.95, 0.0, 0.0],
+                color: [0.03, 0.03, 0.03, 0.9],
+            },
+            VertexP {
+                position: [-0.95, -0.95, 0.0],
+                color: [0.03, 0.03, 0.03, 1.0],
+            },
+            VertexP {
+                position: [0.95,  -0.95, 0.0],
+                color: [0.03, 0.03, 0.03, 1.0],
+            },
+        );
+
+        let (vbuf, slice) = device.create_vertex_buffer_with_slice(&vertex_data, &[1u32, 0u32, 2u32, 3u32, 1u32][..]);
+        let data = pipe_p::Data {
+            vbuf,
+            out_color: view.0.clone(),
+            out_depth: view.1.clone(),
+            screen_size,
+            cursor: [0.0, 0.0],
+        };
+        encoder.draw(&slice, pso, &data);
+    }
+}
+
+impl<B, D> 
+    GraphicsComponent<B, D, gfx::PipelineState<B::Resources, pipe_pt::Meta>>
+    for System 
+where B: gfx::Backend, D: gfx::Device<B::Resources>, 
+{
+    fn render(
+        &self,
+        view: &View<B::Resources>,
+        camera: &Camera<f32>,
+        _: f64,
+        pso: &gfx::PipelineState<B::Resources, pipe_pt::Meta>,
+        encoder: &mut gfx::GraphicsEncoder<B>,
+        sampler: &gfx::handle::Sampler<B::Resources>,
+        device :  &mut D,
+        screen_size: [f32; 2],
+    ) {
+        let font_entry = font_entry(device, &self.font, &format!("abc\n0efg"), [40.0, screen_size[1] / 2.0], [0.8, 0.8, 0.8, 1.0], 1.0);
+
+        let data = pipe_pt::Data {
+            vbuf: font_entry.vertex_buffer,
+            u_texture: (font_entry.texture, sampler.clone()),
+            out_color: view.0.clone(),
+            out_depth: view.1.clone(),
+            screen_size
+        };
+        encoder.draw(&font_entry.slice, pso, &data);
+    }
+}
+
+impl<B, D> 
+    GraphicsComponent<B, D, gfx::PipelineState<B::Resources, pipe_w::Meta>>
+    for GameObject<B::Resources, Vertex> 
+    where B: gfx::Backend, D: gfx::Device<B::Resources>,
+{
     fn render(
         &self,
         view: &View<B::Resources>,
         camera: &Camera<f32>,
         elapsed: f64,
-        pso: &Self::PSO,
+        pso: &gfx::PipelineState<B::Resources, pipe_w::Meta>,
         encoder: &mut gfx::GraphicsEncoder<B>,
         sampler: &gfx::handle::Sampler<B::Resources>,
         _:  &mut D,
+        _: [f32; 2],
     ) {
         let mv = camera.view * Matrix4::from_translation(self.position.to_vec());
         let mvp = camera.perspective * mv;
@@ -1125,7 +1270,7 @@ impl<R: gfx::Resources, V> GameObject<R, V> {
             vec!({Skinning{ transform: identity.into()}})
         }
     }
-    fn get_skinning_at(&self, index: usize) -> Vec<Skinning> {
+    fn _get_skinning_at(&self, index: usize) -> Vec<Skinning> {
         if self.joints.len() > 0 {
             let mut local = Vec::<Matrix4<f32>>::with_capacity(255);
             self.joints.iter().map(|j| {
@@ -1363,8 +1508,4 @@ ORDER BY JointIndex
     }
     Ok(joints)
 }
-
-
-
-
 

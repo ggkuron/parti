@@ -4,6 +4,7 @@
 
 * libsqlite3-dev/xenial,now 3.11.0-1ubuntu1 amd64 
 * libfreetype6-dev/xenial-updates,xenial-security,now 2.6.1-0.1ubuntu2.3 amd64
+* libudev-dev
 
 ## mingw64
 
