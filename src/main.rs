@@ -21,20 +21,10 @@ pub fn main() {
         window, width, height
     );
 
-    let mut running = true;
-    while running {
+    while app.running {
         events_loop.poll_events(|event| {
             if let glutin::Event::WindowEvent { event, .. } = event {
-                match event {
-                    glutin::WindowEvent::Closed | 
-                    glutin::WindowEvent::KeyboardInput {
-                        input: glutin::KeyboardInput {
-                            state: glutin::ElementState::Pressed,
-                            virtual_keycode: Some(glutin::VirtualKeyCode::Escape), ..
-                        }, ..
-                    } => running = false,
-                    _ => app.handle_input(event) 
-                }
+                app.handle_input(event) 
             }
         });
         app.render();

@@ -1,3 +1,4 @@
+#![feature(conservative_impl_trait)]
 #[macro_use]
 extern crate gfx;
 extern crate glutin;
@@ -33,6 +34,8 @@ use gfx::{
 };
 use gfx::memory::Typed;
 use gfx::format::Formatted;
+
+use std::thread;
 
 pub type ColorFormat = gfx::format::Srgba8;
 pub type DepthFormat = gfx::format::DepthStencil;
@@ -74,7 +77,9 @@ type View<R> = (
 );
 
 pub struct App<R: gfx::Resources, B: gfx::Backend> {
-    world: World<B, Vertex>,
+    pub running: bool,
+
+    world: Invoker<SystemCommand, World<B, Vertex>>,
     views: Vec<View<R>>,
     device: gfx_device_gl::Device,
     graphics_pool: gfx::GraphicsCommandPool<B>,
@@ -88,6 +93,7 @@ pub struct App<R: gfx::Resources, B: gfx::Backend> {
     graphics_queue: gfx::queue::GraphicsQueue<B>,
 
     gilrs: Gilrs,
+    input: GamePad,
 }
 
 impl App<gfx_device_gl::Resources, gfx_device_gl::Backend> {
@@ -138,9 +144,11 @@ impl App<gfx_device_gl::Resources, gfx_device_gl::Backend> {
 
         let graphics_pool = graphics_queue.create_graphics_pool(1);
             
-        let world = World::new(
-            &mut device,
-            (width as f32) / (height as f32),
+        let world = Invoker::<SystemCommand, _>::new(
+            World::new(
+                &mut device,
+                (width as f32) / (height as f32),
+            )
         );
 
         let frame_semaphore = device.create_semaphore();
@@ -150,6 +158,7 @@ impl App<gfx_device_gl::Resources, gfx_device_gl::Backend> {
         let gilrs = Gilrs::new();
 
         App {
+            running: true,
             device,
             world,
             frame_semaphore,
@@ -159,15 +168,100 @@ impl App<gfx_device_gl::Resources, gfx_device_gl::Backend> {
             swap_chain,
             graphics_queue,
             views,
-            gilrs
+            gilrs,
+            input: GamePad::default(),
         }
     }
 
     pub fn handle_input(&mut self, ev :glutin::WindowEvent) {
-        self.world.handle_input(ev)
+        match ev {
+            glutin::WindowEvent::Closed | 
+            glutin::WindowEvent::KeyboardInput {
+                input: glutin::KeyboardInput {
+                    state: glutin::ElementState::Pressed,
+                    virtual_keycode: Some(glutin::VirtualKeyCode::Escape), ..
+                }, ..
+            } => self.running = false,
+            glutin::WindowEvent::KeyboardInput {
+                input , .. 
+            } if glutin::ElementState::Pressed == input.state => {
+                match input.virtual_keycode {
+                    Some(glutin::VirtualKeyCode::L) => {
+                         self.input.dpad_right = true 
+                    },
+                    Some(glutin::VirtualKeyCode::H) => {
+                         self.input.dpad_left = true 
+                    },
+                    Some(glutin::VirtualKeyCode::J) => {
+                         self.input.dpad_down = true 
+                    },
+                    Some(glutin::VirtualKeyCode::K) => {
+                         self.input.dpad_up = true 
+                    },
+                    Some(glutin::VirtualKeyCode::W) => {
+                         self.input.left_y = -1.0
+                    },
+                    Some(glutin::VirtualKeyCode::S) => {
+                         self.input.left_y = -1.0
+                    },
+                    Some(glutin::VirtualKeyCode::A) => {
+                         self.input.left_x = -1.0
+                    },
+                    Some(glutin::VirtualKeyCode::D) => {
+                         self.input.left_x = 1.0
+                    },
+                    Some(glutin::VirtualKeyCode::M) => {
+                         self.input.start = true
+                    },
+                    _ => {}
+                }
+            }, 
+            glutin::WindowEvent::KeyboardInput {
+                input , .. 
+            } => {
+                match input.virtual_keycode {
+                    Some(glutin::VirtualKeyCode::L) => {
+                         self.input.dpad_right = false 
+                    },
+                    Some(glutin::VirtualKeyCode::H) => {
+                         self.input.dpad_left = false 
+                    },
+                    Some(glutin::VirtualKeyCode::J) => {
+                         self.input.dpad_down = false
+                    },
+                    Some(glutin::VirtualKeyCode::K) => {
+                         self.input.dpad_up = false 
+                    },
+                    Some(glutin::VirtualKeyCode::W) => {
+                         self.input.left_y = 0.0
+                    },
+                    Some(glutin::VirtualKeyCode::S) => {
+                         self.input.left_y = 0.0
+                    },
+                    Some(glutin::VirtualKeyCode::A) => {
+                         self.input.left_x = 0.0
+                    },
+                    Some(glutin::VirtualKeyCode::D) => {
+                         self.input.left_x = 0.0
+                    },
+                    Some(glutin::VirtualKeyCode::M) => {
+                         self.input.start = false
+                    },
+                    _ => {}
+                }
+            },
+            glutin::WindowEvent::AxisMotion {
+                axis,
+                value,
+                ..
+            } => {
+                println!("axis motion {}: {}", axis, value);
+            },
+            _   => { }
+        }
     }
 
-    fn pre_render(&mut self) {
+    fn update(&mut self) {
         while let Some(ev) = self.gilrs.next_event() {
             self.gilrs.update(&ev);
             let id = ev.id;
@@ -184,34 +278,28 @@ impl App<gfx_device_gl::Resources, gfx_device_gl::Backend> {
 
         {
             let pad = &self.gilrs[0];
-
-            if pad.is_pressed(Button::DPadUp) {
-                self.world.avators.append_command(AvatorCommand::Move(Vector3::new(0.0,-0.5,0.0)))
+            if pad.is_connected() {
+                self.input = GamePad {
+                    dpad_up: pad.is_pressed(Button::DPadUp),
+                    dpad_down: pad.is_pressed(Button::DPadDown),
+                    dpad_left: pad.is_pressed(Button::DPadLeft), 
+                    dpad_right: pad.is_pressed(Button::DPadRight),
+                    start: pad.is_pressed(Button::Start),
+                    left_x: pad.value(Axis::LeftStickX),
+                    left_y: pad.value(Axis::LeftStickY),
+                    east: pad.is_pressed(Button::East),
+                    south: pad.is_pressed(Button::South),
+                };
             }
-            if pad.is_pressed(Button::DPadDown) {
-                self.world.avators.append_command(AvatorCommand::Move(Vector3::new(0.0,0.5,0.0)))
-            }
-            if pad.is_pressed(Button::DPadLeft) {
-                self.world.avators.append_command(AvatorCommand::Move(Vector3::new(-0.5,0.0,0.0)))
-            }
-            if pad.is_pressed(Button::DPadRight) {
-                self.world.avators.append_command(AvatorCommand::Move(Vector3::new(0.5,0.0,0.0)))
-            }
-            if pad.is_pressed(Button::Start) {
-                self.world.system.append_command(SystemCommand::ModeChange());
-            }
-            let x = pad.value(Axis::LeftStickX);
-            let y = pad.value(Axis::LeftStickY);
-            self.world.avators.append_command(AvatorCommand::Move(Vector3::new(x, 0.0, 0.0)));
-            self.world.avators.append_command(AvatorCommand::Move(Vector3::new(0.0, y, 0.0)));
+            self.world.append_command(SystemCommand::Input(self.input));
         }
-
         self.gilrs.inc();
-        self.world.execute_all_commands()
+        self.world.execute_all_commands();
+        self.world.target.execute_all();
     }
 
     pub fn render(&mut self) {
-        self.pre_render();
+        self.update();
 
         let frame = self.swap_chain.acquire_frame(FrameSync::Semaphore(&self.frame_semaphore));
         let view = self.views[frame.id()].clone();
@@ -221,7 +309,7 @@ impl App<gfx_device_gl::Resources, gfx_device_gl::Backend> {
             encoder.clear(&view.0.clone(), CLEAR_COLOR);
             encoder.clear_depth(&view.1.clone(), 1.0);
 
-            self.world.render(&view, &mut encoder, &mut self.device);
+            self.world.target.render(&view, &mut encoder, &mut self.device);
 
             encoder.synced_flush(&mut self.graphics_queue, &[&self.frame_semaphore], &[&self.draw_semaphore], Some(&self.frame_fence))
                 .expect("Colud not flush encoder");
@@ -243,7 +331,7 @@ enum CameraCommand {
 }
 enum SystemCommand {
     Exit,
-    ModeChange(),
+    Input(GamePad),
 }
 
 trait Command<T> {
@@ -257,25 +345,31 @@ struct Invoker<Cmd, T> {
     current_index: usize,
 }
 
-struct System {
-    timer: coarsetime::Instant,
-    state: WorldState,
-    font: Font,
+#[derive(Debug, Copy, Clone, PartialEq)]
+struct GamePad {
+    dpad_up: bool,
+    dpad_down: bool,
+    dpad_left: bool,
+    dpad_right: bool,
+    start: bool,
+    south: bool,
+    east: bool,
+    left_x: f32,
+    left_y: f32,
 }
 
-impl System {
-    fn new() -> Self {
-        System {
-            timer: coarsetime::Instant::now(),
-            state: WorldState::Render,
-            font : {
-                let font_chars: Vec<char> = "abcdefghijklmnopqrstuvwxyz0123456789.+-_".chars().map(|c| c).collect();
-                Font::from_path(
-                    "assets/VL-PGothic-Regular.ttf",
-                    48,
-                    Some(font_chars.as_slice())
-                )
-            }.expect("failed to create font")
+impl Default for GamePad {
+    fn default() -> GamePad {
+        GamePad {
+            dpad_up: false,
+            dpad_down: false,
+            dpad_left: false,
+            dpad_right: false,
+            start: false,
+            left_x: 0.0,
+            left_y: 0.0,
+            east: false,
+            south: false,
         }
     }
 }
@@ -288,9 +382,12 @@ enum WorldState {
 }
 
 struct World<B: gfx::Backend, V> {
+    timer: coarsetime::Instant,
+    state: WorldState,
+
     camera: Invoker<CameraCommand, Camera<f32>>,
     avators: Invoker<AvatorCommand, HashMap<i32, GameObject<B::Resources, V>>>,
-    system: Invoker<SystemCommand, System>,
+
     sampler: gfx::handle::Sampler<B::Resources>,
 
     pso: gfx::PipelineState<B::Resources, pipe_w::Meta>,
@@ -299,8 +396,6 @@ struct World<B: gfx::Backend, V> {
     pso_pt: gfx::PipelineState<B::Resources, pipe_pt::Meta>,
 
     font: Font,
-
-    time: f64,
 }
 
 fn open_connection() -> Connection {
@@ -330,6 +425,7 @@ impl<B: gfx::Backend> World<B, Vertex> {
                     far: 1000.0,
             })
         );
+
         let sampler = {
             let sampler_info = gfx::texture::SamplerInfo::new(
                 gfx::texture::FilterMethod::Trilinear,
@@ -543,48 +639,78 @@ impl<B: gfx::Backend> World<B, Vertex> {
  
         World {
             avators,
-            camera, 
-            system: Invoker::<SystemCommand, System>::new(System::new()),
+            camera,
+
             sampler,
             pso,
             pso_p,
             pso_w2,
             pso_pt,
             font,
-            time: 0.0,
+            timer: coarsetime::Instant::now(),
+
+            state: WorldState::Render,
         }
     }
     fn camera(&self) -> &Camera<f32> {
         &self.camera.target
     }
-    fn update(&mut self) {
-        if self.system.target.state != WorldState::Pose {
-            self.time = self.system.target.timer.elapsed().as_f64();
-        } 
-    }
     fn render<D: gfx::Device<B::Resources>>(&mut self, view: &View<B::Resources>, encoder: &mut gfx::GraphicsEncoder<B>, device: &mut D) {
-        self.update();
+        use gfx::traits::DeviceExt;
+
+        let time = self.timer.elapsed().as_f64();
 
         let (screen_width, screen_height, _, _) = view.0.get_dimensions();
-        let screen_size = {
-            [screen_width as f32, screen_height as f32]
-        };
+        let screen_size = [screen_width as f32, screen_height as f32];
 
-        if self.system.target.state == WorldState::Pose {
-            self.system.target.render(
-                view, self.camera(), self.time, &self.pso_p, encoder, &self.sampler, device, screen_size
+        if self.state == WorldState::Pose {
+            let vertex_data = vec!(
+                VertexP {
+                    position: [-0.95, 0.0, 0.0],
+                    color: [0.03, 0.03, 0.03, 0.9],
+                }, 
+                VertexP {
+                    position: [0.95, 0.0, 0.0],
+                    color: [0.03, 0.03, 0.03, 0.9],
+                },
+                VertexP {
+                    position: [-0.95, -0.95, 0.0],
+                    color: [0.03, 0.03, 0.03, 1.0],
+                },
+                VertexP {
+                    position: [0.95,  -0.95, 0.0],
+                    color: [0.03, 0.03, 0.03, 1.0],
+                },
             );
-            self.system.target.render(
-                view, self.camera(), self.time, &self.pso_pt, encoder, &self.sampler, device, screen_size
-            );
+
+            let (vbuf, slice) = device.create_vertex_buffer_with_slice(&vertex_data, &[1u32, 0u32, 2u32, 3u32, 1u32][..]);
+            let data = pipe_p::Data {
+                vbuf,
+                out_color: view.0.clone(),
+                out_depth: view.1.clone(),
+                screen_size,
+                cursor: [0.0, 0.0],
+            };
+            encoder.draw(&slice, &self.pso_p, &data);
+
+            let font_entry = font_entry(device, &self.font, &format!("abc\n0efg"), [40.0, screen_size[1] / 2.0], [0.8, 0.8, 0.8, 1.0], 1.0);
+ 
+            let data = pipe_pt::Data {
+                vbuf: font_entry.vertex_buffer,
+                u_texture: (font_entry.texture, self.sampler.clone()),
+                out_color: view.0.clone(),
+                out_depth: view.1.clone(),
+                screen_size
+            };
+            encoder.draw(&font_entry.slice, &self.pso_pt, &data);
         }
 
         let camera = self.camera(); 
         for obj in self.avators.target.values() {
-            obj.render(view, camera, self.time, &self.pso, encoder,  &self.sampler, device, screen_size);
+            obj.render(view, camera, time, &self.pso, encoder,  &self.sampler, device, screen_size);
         }
         {
-            let font_entry = font_entry(device, &self.font, &format!("{:?}", &self.time), [0.0, 0.0], [0.0;4], 0.1);
+            let font_entry = font_entry(device, &self.font, &format!("{:?}", &time), [0.0, 0.0], [0.0;4], 0.1);
 
             let data = pipe_w2::Data {
                 vbuf: font_entry.vertex_buffer,
@@ -599,78 +725,9 @@ impl<B: gfx::Backend> World<B, Vertex> {
             };
             encoder.draw(&font_entry.slice, &self.pso_w2, &data);
         }
-
     }
 
-    fn handle_input(&mut self, ev: glutin::WindowEvent) {
-
-        match ev {
-            glutin::WindowEvent::KeyboardInput {
-                input: glutin::KeyboardInput {
-                    state: glutin::ElementState::Pressed,
-                    virtual_keycode: Some(glutin::VirtualKeyCode::L), ..
-                }, ..
-            } => self.avators.append_command(AvatorCommand::Move(Vector3::new(0.5,0.0,0.0))),
-            glutin::WindowEvent::KeyboardInput {
-                input: glutin::KeyboardInput {
-                    state: glutin::ElementState::Pressed,
-                    virtual_keycode: Some(glutin::VirtualKeyCode::H), ..
-                }, ..
-            } => self.avators.append_command(AvatorCommand::Move(Vector3::new(-0.5,0.0,0.0))),
-            glutin::WindowEvent::KeyboardInput {
-                input: glutin::KeyboardInput {
-                    state: glutin::ElementState::Pressed,
-                    virtual_keycode: Some(glutin::VirtualKeyCode::J), ..
-                }, ..
-            } => self.avators.append_command(AvatorCommand::Move(Vector3::new(0.0,-0.5,0.0))),
-            glutin::WindowEvent::KeyboardInput {
-                input: glutin::KeyboardInput {
-                    state: glutin::ElementState::Pressed,
-                    virtual_keycode: Some(glutin::VirtualKeyCode::K), ..
-                }, ..
-            } => self.avators.append_command(AvatorCommand::Move(Vector3::new(0.0,0.5,0.0))),
-            glutin::WindowEvent::KeyboardInput {
-                input: glutin::KeyboardInput {
-                    state: glutin::ElementState::Pressed,
-                    virtual_keycode: Some(glutin::VirtualKeyCode::W), ..
-                }, ..
-            } => self.camera.append_command(CameraCommand::Move(Vector3::new(0.0, 0.1, 0.0))),
-            glutin::WindowEvent::KeyboardInput {
-                input: glutin::KeyboardInput {
-                    state: glutin::ElementState::Pressed,
-                    virtual_keycode: Some(glutin::VirtualKeyCode::S), ..
-                }, ..
-            } => self.camera.append_command(CameraCommand::Move(Vector3::new(0.0, -0.1, 0.0))),
-            glutin::WindowEvent::KeyboardInput {
-                input: glutin::KeyboardInput {
-                    state: glutin::ElementState::Pressed,
-                    virtual_keycode: Some(glutin::VirtualKeyCode::A), ..
-                }, ..
-            } => self.camera.append_command(CameraCommand::Move(Vector3::new(-0.1, 0.0, 0.0))),
-            glutin::WindowEvent::KeyboardInput {
-                input: glutin::KeyboardInput {
-                    state: glutin::ElementState::Pressed,
-                    virtual_keycode: Some(glutin::VirtualKeyCode::D), ..
-                }, ..
-            } => self.camera.append_command(CameraCommand::Move(Vector3::new(0.1, 0.0, 0.0))),
-            glutin::WindowEvent::KeyboardInput {
-                input: glutin::KeyboardInput {
-                    state: glutin::ElementState::Pressed,
-                    virtual_keycode: Some(glutin::VirtualKeyCode::M), ..
-                }, ..
-            } => self.system.append_command(SystemCommand::ModeChange()) , 
-            glutin::WindowEvent::AxisMotion {
-                axis,
-                value,
-                ..
-            } => {
-                println!("axis motion {}: {}", axis, value);
-            },
-            _   => { }
-        }
-    }
-    fn execute_all_commands(&mut self) {
-        self.system.execute_all_commands();
+    fn execute_all(&mut self) {
         self.avators.execute_all_commands();
         self.camera.execute_all_commands();
     }
@@ -711,18 +768,34 @@ impl<Cmd, T> Invoker<Cmd, T>
     }
 }
 
-impl Command<System> for SystemCommand {
+impl<B: gfx::Backend, V> Command<World<B,V>> for SystemCommand {
     fn get_level(&self) -> Level {
         Level::System
     }
-    fn execute(&self, sys: &mut System) {
+    fn execute(&self, world: &mut World<B,V>) {
         match *self {
-            SystemCommand::ModeChange() => {
-                sys.state = if sys.state == WorldState::Render {
-                    WorldState::Pose
-                } else { 
-                    WorldState::Render 
-                };
+            SystemCommand::Input(ref pad) => {
+                if pad.dpad_down {
+                    world.avators.append_command(AvatorCommand::Move(Vector3::new(0.0,0.5,0.0)))
+                }
+                if pad.dpad_up {
+                    world.avators.append_command(AvatorCommand::Move(Vector3::new(0.0,-0.5,0.0)))
+                }
+                if pad.dpad_left {
+                    world.avators.append_command(AvatorCommand::Move(Vector3::new(-0.5,0.0,0.0)))
+                }
+                if pad.dpad_right {
+                    world.avators.append_command(AvatorCommand::Move(Vector3::new(0.5,0.0,0.0)))
+                }
+                if pad.start {
+                    world.state = if world.state == WorldState::Render {
+                        WorldState::Pose
+                    } else { 
+                        WorldState::Render 
+                    };
+                }
+                world.avators.append_command(AvatorCommand::Move(Vector3::new(pad.left_x, 0.0, 0.0)));
+                world.avators.append_command(AvatorCommand::Move(Vector3::new(0.0, pad.left_y, 0.0)));
             },
             SystemCommand::Exit => {
             }
@@ -1008,10 +1081,10 @@ fn query_entry<R, D, T> (
     device: &mut D,
     ids: &[i32],
 ) -> RusqliteResult<HashMap<i32, GameObject<R, Vertex>>> 
-    where
-        R: gfx::Resources,
-        D: gfx::Device<R>,
-        T: gfx::format::TextureFormat,
+  where
+    R: gfx::Resources,
+    D: gfx::Device<R>,
+    T: gfx::format::TextureFormat,
 {
     use gfx::traits::DeviceExt;
 
@@ -1043,6 +1116,7 @@ fn query_entry<R, D, T> (
     Ok(result)
 }
 
+
 struct GameObject<R: gfx::Resources, V> {
     entries: Vec<Entry<R, V, [f32;4]>>,
     position: Point3<f32>,
@@ -1073,9 +1147,8 @@ impl<T: cgmath::BaseFloat> Translate<T> for Camera<T>
 trait GraphicsComponent<
     B: gfx::Backend,
     D: gfx::Device<B::Resources>,
-    PSO
-> 
-{
+    PSO: 
+> {
     fn render(
         &self,
         view: &View<B::Resources>,
@@ -1084,93 +1157,16 @@ trait GraphicsComponent<
         pso: &PSO,
         encoder: &mut gfx::GraphicsEncoder<B>,
         sampler: &gfx::handle::Sampler<B::Resources>,
-        dievice: &mut D,
+        device: &mut D,
         screen_size: [f32; 2],
     );
 }
 
-impl<B, D> 
-    GraphicsComponent<B, D, gfx::PipelineState<B::Resources, pipe_p::Meta>>
-    for System 
-where B: gfx::Backend, D: gfx::Device<B::Resources>, 
-{
-    fn render(
-        &self,
-        view: &View<B::Resources>,
-        camera: &Camera<f32>,
-        _: f64,
-        pso: &gfx::PipelineState<B::Resources, pipe_p::Meta>,
-        encoder: &mut gfx::GraphicsEncoder<B>,
-        _: &gfx::handle::Sampler<B::Resources>,
-        device :  &mut D,
-        screen_size: [f32; 2],
-    ) {
-        use gfx::traits::DeviceExt;
-        let vertex_data = vec!(
-            VertexP {
-                position: [-0.95, 0.0, 0.0],
-                color: [0.03, 0.03, 0.03, 0.9],
-            }, 
-            VertexP {
-                position: [0.95, 0.0, 0.0],
-                color: [0.03, 0.03, 0.03, 0.9],
-            },
-            VertexP {
-                position: [-0.95, -0.95, 0.0],
-                color: [0.03, 0.03, 0.03, 1.0],
-            },
-            VertexP {
-                position: [0.95,  -0.95, 0.0],
-                color: [0.03, 0.03, 0.03, 1.0],
-            },
-        );
-
-        let (vbuf, slice) = device.create_vertex_buffer_with_slice(&vertex_data, &[1u32, 0u32, 2u32, 3u32, 1u32][..]);
-        let data = pipe_p::Data {
-            vbuf,
-            out_color: view.0.clone(),
-            out_depth: view.1.clone(),
-            screen_size,
-            cursor: [0.0, 0.0],
-        };
-        encoder.draw(&slice, pso, &data);
-    }
-}
-
-impl<B, D> 
-    GraphicsComponent<B, D, gfx::PipelineState<B::Resources, pipe_pt::Meta>>
-    for System 
-where B: gfx::Backend, D: gfx::Device<B::Resources>, 
-{
-    fn render(
-        &self,
-        view: &View<B::Resources>,
-        camera: &Camera<f32>,
-        _: f64,
-        pso: &gfx::PipelineState<B::Resources, pipe_pt::Meta>,
-        encoder: &mut gfx::GraphicsEncoder<B>,
-        sampler: &gfx::handle::Sampler<B::Resources>,
-        device :  &mut D,
-        screen_size: [f32; 2],
-    ) {
-        let font_entry = font_entry(device, &self.font, &format!("abc\n0efg"), [40.0, screen_size[1] / 2.0], [0.8, 0.8, 0.8, 1.0], 1.0);
-
-        let data = pipe_pt::Data {
-            vbuf: font_entry.vertex_buffer,
-            u_texture: (font_entry.texture, sampler.clone()),
-            out_color: view.0.clone(),
-            out_depth: view.1.clone(),
-            screen_size
-        };
-        encoder.draw(&font_entry.slice, pso, &data);
-    }
-}
 
 impl<B, D> 
     GraphicsComponent<B, D, gfx::PipelineState<B::Resources, pipe_w::Meta>>
     for GameObject<B::Resources, Vertex> 
-    where B: gfx::Backend, D: gfx::Device<B::Resources>,
-{
+  where B: gfx::Backend, D: gfx::Device<B::Resources> {
     fn render(
         &self,
         view: &View<B::Resources>,
