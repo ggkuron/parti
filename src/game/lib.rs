@@ -693,16 +693,10 @@ impl<B: gfx::Backend> World<B, Vertex> {
             };
             encoder.draw(&slice, &self.pso_p, &data);
 
-            let font_entry = font_entry(device, &self.font, &format!("abc\n0efg"), [40.0, screen_size[1] / 2.0], [0.8, 0.8, 0.8, 1.0], 1.0);
- 
-            let data = pipe_pt::Data {
-                vbuf: font_entry.vertex_buffer,
-                u_texture: (font_entry.texture, self.sampler.clone()),
-                out_color: view.0.clone(),
-                out_depth: view.1.clone(),
-                screen_size
-            };
-            encoder.draw(&font_entry.slice, &self.pso_pt, &data);
+            {
+                let layout = &self.font.layout(format!("abc\n0efg"), [40.0, screen_size[1] / 2.0], [0.8, 0.8, 0.8, 1.0], 1.0);
+                layout.render(view, self.camera(), time, &self.pso_pt, encoder, &self.sampler, device, screen_size);
+            }
         }
 
         let camera = self.camera(); 
@@ -710,20 +704,8 @@ impl<B: gfx::Backend> World<B, Vertex> {
             obj.render(view, camera, time, &self.pso, encoder,  &self.sampler, device, screen_size);
         }
         {
-            let font_entry = font_entry(device, &self.font, &format!("{:?}", &time), [0.0, 0.0], [0.0;4], 0.1);
-
-            let data = pipe_w2::Data {
-                vbuf: font_entry.vertex_buffer,
-                u_model_view_proj: camera.projection.into(),
-                u_model_view: camera.view.into(),
-                u_light: [1.0, 0.5, -0.5f32],
-                u_ambient_color: [0.00, 0.00, 0.01, 0.4],
-                u_eye_direction: camera.direction().into(),
-                u_texture: (font_entry.texture, self.sampler.clone()),
-                out_color: view.0.clone(),
-                out_depth: view.1.clone()
-            };
-            encoder.draw(&font_entry.slice, &self.pso_w2, &data);
+            let layout = &self.font.layout(format!("{:?}", &time), [0.0, 0.0], [0.0;4], 0.1);
+            layout.render(view, self.camera(), time, &self.pso_w2, encoder, &self.sampler, device, screen_size);
         }
     }
 
@@ -1201,6 +1183,69 @@ impl<B, D>
         }
     }
 }
+
+impl<'a, 'b, B, D> 
+    GraphicsComponent<B, D, gfx::PipelineState<B::Resources, pipe_pt::Meta>>
+    for FontLayout<'a>
+    where B: gfx::Backend, D: gfx::Device<B::Resources> {
+    fn render(
+        &self,
+        view: &View<B::Resources>,
+        camera: &Camera<f32>,
+        elapsed: f64,
+        pso: &gfx::PipelineState<B::Resources, pipe_pt::Meta>,
+        encoder: &mut gfx::GraphicsEncoder<B>,
+        sampler: &gfx::handle::Sampler<B::Resources>,
+        device:  &mut D,
+        screen_size: [f32; 2],
+        ) {
+        let font_entry = font_entry(device, &self.font, &self.text, self.position, self.color, self.scale);
+
+        let data = pipe_pt::Data {
+            vbuf: font_entry.vertex_buffer,
+            u_texture: (font_entry.texture, sampler.clone()),
+            out_color: view.0.clone(),
+            out_depth: view.1.clone(),
+            screen_size
+        };
+        encoder.draw(&font_entry.slice, pso, &data);
+
+    }
+}
+
+impl<'a, 'b, B, D> 
+    GraphicsComponent<B, D, gfx::PipelineState<B::Resources, pipe_w2::Meta>>
+    for FontLayout<'a>
+    where B: gfx::Backend, D: gfx::Device<B::Resources> {
+    fn render(
+        &self,
+        view: &View<B::Resources>,
+        camera: &Camera<f32>,
+        elapsed: f64,
+        pso: &gfx::PipelineState<B::Resources, pipe_w2::Meta>,
+        encoder: &mut gfx::GraphicsEncoder<B>,
+        sampler: &gfx::handle::Sampler<B::Resources>,
+        device:  &mut D,
+        screen_size: [f32; 2],
+        ) {
+        let font_entry = font_entry(device, &self.font, &self.text, self.position, self.color, self.scale);
+
+        let data = pipe_w2::Data {
+            vbuf: font_entry.vertex_buffer,
+            u_model_view_proj: camera.projection.into(),
+            u_model_view: camera.view.into(),
+            u_light: [1.0, 0.5, -0.5f32],
+            u_ambient_color: [0.00, 0.00, 0.01, 0.4],
+            u_eye_direction: camera.direction().into(),
+            u_texture: (font_entry.texture, sampler.clone()),
+            out_color: view.0.clone(),
+            out_depth: view.1.clone()
+        };
+        encoder.draw(&font_entry.slice, pso, &data);
+    }
+}
+
+
 
 impl<R: gfx::Resources, V> GameObject<R, V> {
     fn get_skinning(&self, time: f64) -> Vec<Skinning> {

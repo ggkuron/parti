@@ -14,6 +14,14 @@ pub struct Font {
     pub texture: Image<(gfx::format::R8, gfx::format::Unorm)>,
 }
 
+pub struct FontLayout<'a> {
+    pub font: &'a Font,
+    pub text: String,
+    pub position: [f32;2],
+    pub color: [f32;4],
+    pub scale: f32,
+}
+
 pub type FontResult = Result<Font, FontError>;
 
 #[derive(Debug)]
@@ -162,6 +170,15 @@ impl Font {
             }
         }
         result
+    }
+    pub fn layout<'a>(&'a self, text: String, position: [f32;2], color: [f32;4], scale: f32) -> FontLayout<'a>{
+        FontLayout {
+            font: self,
+            text,
+            position,
+            color,
+            scale
+        }
     }
 }
 
