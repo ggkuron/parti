@@ -26,6 +26,7 @@ use gfx::{
     Adapter,
     CommandQueue,
     Device,
+    Backend,
     FrameSync,
     GraphicsPoolExt,
     Surface,
@@ -34,8 +35,6 @@ use gfx::{
 };
 use gfx::memory::Typed;
 use gfx::format::Formatted;
-
-use std::thread;
 
 pub type ColorFormat = gfx::format::Srgba8;
 pub type DepthFormat = gfx::format::DepthStencil;
@@ -386,16 +385,20 @@ struct World<B: gfx::Backend, V> {
     state: WorldState,
 
     camera: Invoker<CameraCommand, Camera<f32>>,
-    avators: Invoker<AvatorCommand, HashMap<i32, GameObject<B::Resources, V>>>,
+    avators: Invoker<AvatorCommand, HashMap<i32, GameObject<B, V>>>,
 
     sampler: gfx::handle::Sampler<B::Resources>,
+    pso_set: PipelineStateObjectSet<B::Resources>,
+    inspector: InspectMenu,
 
-    pso: gfx::PipelineState<B::Resources, pipe_w::Meta>,
-    pso_w2: gfx::PipelineState<B::Resources, pipe_w2::Meta>,
-    pso_p: gfx::PipelineState<B::Resources, pipe_p::Meta>,
-    pso_pt: gfx::PipelineState<B::Resources, pipe_pt::Meta>,
+    font: Font<B>,
+}
 
-    font: Font,
+struct PipelineStateObjectSet<R: gfx::Resources> {
+    pso: gfx::PipelineState<R, pipe_w::Meta>,
+    w2: gfx::PipelineState<R, pipe_w2::Meta>,
+    p: gfx::PipelineState<R, pipe_p::Meta>,
+    pt: gfx::PipelineState<R, pipe_pt::Meta>,
 }
 
 fn open_connection() -> Connection {
@@ -411,8 +414,8 @@ impl<B: gfx::Backend> World<B, Vertex> {
 
         let conn = open_connection();
 
-        let avators = Invoker::<AvatorCommand, HashMap<i32, GameObject<B::Resources, _>>>::new(
-            query_entry::<B::Resources, D, TextureFormat>(&conn, device, &[1,2]).unwrap()
+        let avators = Invoker::<AvatorCommand, HashMap<i32, GameObject<B, _>>>::new(
+            query_entry::<B, D, TextureFormat>(&conn, device, &[1,2]).unwrap()
         );
         let camera = Invoker::<CameraCommand, Camera<f32>>::new(
             Camera::new(
@@ -636,34 +639,73 @@ impl<B: gfx::Backend> World<B, Vertex> {
                 Some(font_chars.as_slice())
             )
         }.expect("failed to create font");
- 
+
+        let pso_set = PipelineStateObjectSet {
+            pso,
+            p: pso_p,
+            w2: pso_w2,
+            pt: pso_pt,
+        };
         World {
             avators,
             camera,
-
             sampler,
-            pso,
-            pso_p,
-            pso_w2,
-            pso_pt,
+            pso_set,
             font,
             timer: coarsetime::Instant::now(),
-
             state: WorldState::Render,
+            inspector: InspectMenu {
+                color: [0.03, 0.03, 0.0],
+            }
         }
     }
     fn camera(&self) -> &Camera<f32> {
         &self.camera.target
     }
     fn render<D: gfx::Device<B::Resources>>(&mut self, view: &View<B::Resources>, encoder: &mut gfx::GraphicsEncoder<B>, device: &mut D) {
-        use gfx::traits::DeviceExt;
-
         let time = self.timer.elapsed().as_f64();
 
         let (screen_width, screen_height, _, _) = view.0.get_dimensions();
         let screen_size = [screen_width as f32, screen_height as f32];
 
         if self.state == WorldState::Pose {
+            self.inspector.render(view, time, &self.pso_set, &self.font, encoder, &self.sampler, device, screen_size);
+        }
+
+        let camera = self.camera(); 
+        for obj in self.avators.target.values() {
+            obj.render(view, camera, time, &self.pso_set.pso, encoder,  &self.sampler);
+        }
+        {
+            let layout = &self.font.layout(format!("{:?}", &time), [0.0, 0.0], [0.0;4], 0.1);
+            layout.renderIntoView(view, self.camera(), &self.pso_set.w2, encoder, &self.sampler, device);
+        }
+    }
+
+    fn execute_all(&mut self) {
+        self.avators.execute_all_commands();
+        self.camera.execute_all_commands();
+    }
+}
+
+
+struct InspectMenu {
+    color: [f32; 3],
+}
+
+impl InspectMenu {
+        fn render<B: gfx::Backend, D: gfx::Device<B::Resources>> (
+            &self,
+            view: &View<B::Resources>,
+            time: f64,
+            pso_set: &PipelineStateObjectSet<B::Resources>,
+            font: &Font<B>,
+            encoder: &mut gfx::GraphicsEncoder<B>,
+            sampler: &gfx::handle::Sampler<B::Resources>,
+            device:  &mut D,
+            screen_size: [f32; 2],
+        ) {
+            use gfx::traits::DeviceExt;
             let vertex_data = vec!(
                 VertexP {
                     position: [-0.95, 0.0, 0.0],
@@ -691,29 +733,15 @@ impl<B: gfx::Backend> World<B, Vertex> {
                 screen_size,
                 cursor: [0.0, 0.0],
             };
-            encoder.draw(&slice, &self.pso_p, &data);
+            encoder.draw(&slice, &pso_set.p, &data);
 
             {
-                let layout = &self.font.layout(format!("abc\n0efg"), [40.0, screen_size[1] / 2.0], [0.8, 0.8, 0.8, 1.0], 1.0);
-                layout.render(view, self.camera(), time, &self.pso_pt, encoder, &self.sampler, device, screen_size);
+                let layout = font.layout(format!("abc\n0efg"), [40.0, screen_size[1] / 2.0], [0.8, 0.8, 0.8, 1.0], 1.0);
+                layout.render(view, &pso_set.pt, encoder, sampler, device, screen_size);
             }
         }
-
-        let camera = self.camera(); 
-        for obj in self.avators.target.values() {
-            obj.render(view, camera, time, &self.pso, encoder,  &self.sampler, device, screen_size);
-        }
-        {
-            let layout = &self.font.layout(format!("{:?}", &time), [0.0, 0.0], [0.0;4], 0.1);
-            layout.render(view, self.camera(), time, &self.pso_w2, encoder, &self.sampler, device, screen_size);
-        }
-    }
-
-    fn execute_all(&mut self) {
-        self.avators.execute_all_commands();
-        self.camera.execute_all_commands();
-    }
 }
+
 
 impl<Cmd, T> Invoker<Cmd, T> {
     fn new(t: T) -> Self {
@@ -803,11 +831,11 @@ impl Command<Camera<f32>> for CameraCommand {
     }
 }
 
-impl<R: gfx::Resources, V> Command<GameObject<R, V>> for AvatorCommand {
+impl<B: gfx::Backend, V> Command<GameObject<B, V>> for AvatorCommand {
     fn get_level(&self) -> Level {
         Level::Avator
     }
-    fn execute(&self, c: &mut GameObject<R, V>) {
+    fn execute(&self, c: &mut GameObject<B, V>) {
         match *self {
             AvatorCommand::Move(v) => {
                 c.translate(v); 
@@ -815,11 +843,11 @@ impl<R: gfx::Resources, V> Command<GameObject<R, V>> for AvatorCommand {
         }
     }
 }
-impl<R: gfx::Resources, V> Command<HashMap<i32, GameObject<R, V>>> for AvatorCommand {
+impl<B: gfx::Backend, V> Command<HashMap<i32, GameObject<B, V>>> for AvatorCommand {
     fn get_level(&self) -> Level {
         Level::Avator
     }
-    fn execute(&self, c: &mut HashMap<i32, GameObject<R, V>>) {
+    fn execute(&self, c: &mut HashMap<i32, GameObject<B, V>>) {
         match *self {
             AvatorCommand::Move(v) => {
                 c.get_mut(&1).unwrap().translate(v); 
@@ -982,7 +1010,13 @@ fn entry_<'e, R, F, V, T>(device: &mut F, vertex_data: &[V], index_data: &[u32],
 }
 
 
-fn font_entry<R: gfx::Resources, D: gfx::Device<R>>(device: &mut D, font: &Font, text: &str, pos: [f32;2], color: [f32;4], scale: f32) -> Entry<R, Vertex, f32> 
+fn font_entry<B: gfx::Backend, R: gfx::Resources, D: gfx::Device<R>>(
+    device: &mut D,
+    font: &Font<B>,
+    text: &str,
+    pos: [f32;2],
+    color: [f32;4],
+    scale: f32) -> Entry<R, Vertex, f32> 
 {
     let mut vertex_data = Vec::new();
     let mut index_data = Vec::new();
@@ -1058,16 +1092,14 @@ fn font_entry<R: gfx::Resources, D: gfx::Device<R>>(device: &mut D, font: &Font,
     )
 }
 
-fn query_entry<R, D, T> (
+fn query_entry<
+    B: gfx::Backend,
+    D: gfx::Device<B::Resources>,
+    T: gfx::format::TextureFormat>(
     conn: &Connection,
-    device: &mut D,
+    device: &mut D, 
     ids: &[i32],
-) -> RusqliteResult<HashMap<i32, GameObject<R, Vertex>>> 
-  where
-    R: gfx::Resources,
-    D: gfx::Device<R>,
-    T: gfx::format::TextureFormat,
-{
+) -> RusqliteResult<HashMap<i32, GameObject<B, Vertex>>> {
     use gfx::traits::DeviceExt;
 
     let mut result = HashMap::default();
@@ -1092,6 +1124,8 @@ fn query_entry<R, D, T> (
                 joints,
                 animations,
                 skinning_buffer,
+                time: 0.0,
+                backend: std::marker::PhantomData::<B>
             }
         );
     }
@@ -1099,28 +1133,30 @@ fn query_entry<R, D, T> (
 }
 
 
-struct GameObject<R: gfx::Resources, V> {
-    entries: Vec<Entry<R, V, [f32;4]>>,
+struct GameObject<B: gfx::Backend, V> {
+    entries: Vec<Entry<B::Resources, V, [f32;4]>>,
     position: Point3<f32>,
     // front: Vector3<f32>,
     joints: Vec<Joint>,
     animations: Vec<Vec<(f32, Animation)>>,
 
-    skinning_buffer: gfx::handle::Buffer<R, Skinning>,
+    skinning_buffer: gfx::handle::Buffer<B::Resources, Skinning>,
+    time: f32,
+
+    backend: std::marker::PhantomData<B>
 }
 
 trait Translate<T: cgmath::BaseFloat> {
     fn translate(&mut self, v: Vector3<T>);
 }
 
-impl<R: gfx::Resources, V> Translate<f32> for GameObject<R, V>
+impl<B: gfx::Backend, V> Translate<f32> for GameObject<B, V>
 {
     fn translate(&mut self, v: Vector3<f32>) {
         self.position += v;
     }
 }
-impl<T: cgmath::BaseFloat> Translate<T> for Camera<T> 
-{
+impl<T: cgmath::BaseFloat> Translate<T> for Camera<T> {
     fn translate(&mut self, v: Vector3<T>) {
         self.position += v;
     }
@@ -1129,26 +1165,20 @@ impl<T: cgmath::BaseFloat> Translate<T> for Camera<T>
 trait GraphicsComponent<
     B: gfx::Backend,
     D: gfx::Device<B::Resources>,
-    PSO: 
 > {
     fn render(
         &self,
         view: &View<B::Resources>,
-        camera: &Camera<f32>,
-        _: f64,
-        pso: &PSO,
+        pso: &PipelineStateObjectSet<B::Resources>,
         encoder: &mut gfx::GraphicsEncoder<B>,
         sampler: &gfx::handle::Sampler<B::Resources>,
-        device: &mut D,
+        device: &mut D, 
         screen_size: [f32; 2],
     );
 }
 
 
-impl<B, D> 
-    GraphicsComponent<B, D, gfx::PipelineState<B::Resources, pipe_w::Meta>>
-    for GameObject<B::Resources, Vertex> 
-  where B: gfx::Backend, D: gfx::Device<B::Resources> {
+impl<B: gfx::Backend> GameObject<B, Vertex> {
     fn render(
         &self,
         view: &View<B::Resources>,
@@ -1157,8 +1187,6 @@ impl<B, D>
         pso: &gfx::PipelineState<B::Resources, pipe_w::Meta>,
         encoder: &mut gfx::GraphicsEncoder<B>,
         sampler: &gfx::handle::Sampler<B::Resources>,
-        _:  &mut D,
-        _: [f32; 2],
     ) {
         let mv = camera.view * Matrix4::from_translation(self.position.to_vec());
         let mvp = camera.perspective * mv;
@@ -1184,21 +1212,16 @@ impl<B, D>
     }
 }
 
-impl<'a, 'b, B, D> 
-    GraphicsComponent<B, D, gfx::PipelineState<B::Resources, pipe_pt::Meta>>
-    for FontLayout<'a>
-    where B: gfx::Backend, D: gfx::Device<B::Resources> {
-    fn render(
+impl<'a, B: gfx::Backend> FontLayout<'a, B> {
+    fn render<D: gfx::Device<B::Resources>>(
         &self,
         view: &View<B::Resources>,
-        camera: &Camera<f32>,
-        elapsed: f64,
         pso: &gfx::PipelineState<B::Resources, pipe_pt::Meta>,
         encoder: &mut gfx::GraphicsEncoder<B>,
         sampler: &gfx::handle::Sampler<B::Resources>,
         device:  &mut D,
         screen_size: [f32; 2],
-        ) {
+    ) {
         let font_entry = font_entry(device, &self.font, &self.text, self.position, self.color, self.scale);
 
         let data = pipe_pt::Data {
@@ -1209,24 +1232,18 @@ impl<'a, 'b, B, D>
             screen_size
         };
         encoder.draw(&font_entry.slice, pso, &data);
-
     }
 }
 
-impl<'a, 'b, B, D> 
-    GraphicsComponent<B, D, gfx::PipelineState<B::Resources, pipe_w2::Meta>>
-    for FontLayout<'a>
-    where B: gfx::Backend, D: gfx::Device<B::Resources> {
-    fn render(
+impl<'a, B: gfx::Backend> FontLayout<'a, B> {
+    fn renderIntoView<D: gfx::Device<B::Resources>>(
         &self,
         view: &View<B::Resources>,
         camera: &Camera<f32>,
-        elapsed: f64,
         pso: &gfx::PipelineState<B::Resources, pipe_w2::Meta>,
         encoder: &mut gfx::GraphicsEncoder<B>,
         sampler: &gfx::handle::Sampler<B::Resources>,
-        device:  &mut D,
-        screen_size: [f32; 2],
+        device:  &mut D, 
         ) {
         let font_entry = font_entry(device, &self.font, &self.text, self.position, self.color, self.scale);
 
@@ -1247,7 +1264,7 @@ impl<'a, 'b, B, D>
 
 
 
-impl<R: gfx::Resources, V> GameObject<R, V> {
+impl<B: gfx::Backend, V> GameObject<B, V> {
     fn get_skinning(&self, time: f64) -> Vec<Skinning> {
         if self.joints.len() > 0 {
             let mut local = Vec::<Matrix4<f32>>::with_capacity(255);

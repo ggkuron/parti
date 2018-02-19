@@ -8,21 +8,25 @@ use gfx;
 
 use models::Image;
 
-pub struct Font {
+pub struct Font<B> {
     pub chars: HashMap<char, BitmapChar>,
 
     pub texture: Image<(gfx::format::R8, gfx::format::Unorm)>,
+
+    backend: std::marker::PhantomData<B>
 }
 
-pub struct FontLayout<'a> {
-    pub font: &'a Font,
+pub struct FontLayout<'a, B: 'a> {
+    pub font: &'a Font<B>,
     pub text: String,
     pub position: [f32;2],
     pub color: [f32;4],
     pub scale: f32,
+
+    backend: std::marker::PhantomData<B>
 }
 
-pub type FontResult = Result<Font, FontError>;
+pub type FontResult<B> = Result<Font<B>, FontError>;
 
 #[derive(Debug)]
 pub enum FontError {
@@ -47,13 +51,13 @@ pub struct BitmapChar {
     data: Option<Vec<u8>>,
 }
 
-impl Font {
-    pub fn from_path(path: &str, font_size: u8, chars: Option<&[char]>) -> FontResult {
+impl<B> Font<B> {
+    pub fn from_path(path: &str, font_size: u8, chars: Option<&[char]>) -> FontResult<B> {
         let library = ft::Library::init()?;
         let face = library.new_face(path, 0)?;
         Self::new(face, font_size, chars)
     }
-    fn new<'a>(mut face: ft::Face<'a>, font_size: u8, chars: Option<&[char]>) -> FontResult {
+    fn new<'a>(mut face: ft::Face<'a>, font_size: u8, chars: Option<&[char]>) -> FontResult<B> {
         use std::iter::FromIterator;
         use std::iter::repeat;
         use std::cmp::max;
@@ -152,10 +156,14 @@ impl Font {
             format: std::marker::PhantomData::<(gfx::format::R8, gfx::format::Unorm)>
         };
 
-        Ok(Font{
-            chars,
-            texture
-        })
+        Ok(
+            Font {
+                chars,
+                texture,
+
+                backend: std::marker::PhantomData::<B>,
+            }
+        )
     }
     pub fn get_all_face_chars<'a>(face: &mut Face<'a>) -> HashSet<char> {
         use std::char::from_u32;
@@ -171,13 +179,15 @@ impl Font {
         }
         result
     }
-    pub fn layout<'a>(&'a self, text: String, position: [f32;2], color: [f32;4], scale: f32) -> FontLayout<'a>{
+    pub fn layout<'a>(&'a self, text: String, position: [f32;2], color: [f32;4], scale: f32) -> FontLayout<'a, B> {
         FontLayout {
             font: self,
             text,
             position,
             color,
-            scale
+            scale,
+
+            backend: std::marker::PhantomData::<B>,
         }
     }
 }
