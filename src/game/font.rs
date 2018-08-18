@@ -16,14 +16,14 @@ pub struct Font<B> {
     backend: std::marker::PhantomData<B>
 }
 
-pub struct FontLayout<'a, B: 'a> {
-    pub font: &'a Font<B>,
+pub struct FontLayout<B, D> {
     pub text: String,
     pub position: [f32;2],
     pub color: [f32;4],
     pub scale: f32,
 
-    backend: std::marker::PhantomData<B>
+    backend: std::marker::PhantomData<B>,
+    pub data: Option<D>,
 }
 
 pub type FontResult<B> = Result<Font<B>, FontError>;
@@ -179,15 +179,15 @@ impl<B> Font<B> {
         }
         result
     }
-    pub fn layout<'a>(&'a self, text: String, position: [f32;2], color: [f32;4], scale: f32) -> FontLayout<'a, B> {
+    pub fn layout<D>(&self, text: String, position: [f32;2], color: [f32;4], scale: f32) -> FontLayout<B, D> {
         FontLayout {
-            font: self,
             text,
             position,
             color,
             scale,
 
             backend: std::marker::PhantomData::<B>,
+            data: None,
         }
     }
 }

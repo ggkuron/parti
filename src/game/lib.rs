@@ -26,7 +26,6 @@ use gfx::{
     Adapter,
     CommandQueue,
     Device,
-    Backend,
     FrameSync,
     GraphicsPoolExt,
     Surface,
@@ -386,10 +385,12 @@ struct World<B: gfx::Backend, V> {
 
     camera: Invoker<CameraCommand, Camera<f32>>,
     avators: Invoker<AvatorCommand, HashMap<i32, GameObject<B, V>>>,
+    objects: Vec<GameObject<B, V>>,
+    layout: FontLayout<B, FontBundle<B::Resources, pipe_w2::Data<B::Resources>>>,
 
     sampler: gfx::handle::Sampler<B::Resources>,
     pso_set: PipelineStateObjectSet<B::Resources>,
-    inspector: InspectMenu,
+    inspector: InspectMenu<B>,
 
     font: Font<B>,
 }
@@ -646,17 +647,27 @@ impl<B: gfx::Backend> World<B, Vertex> {
             w2: pso_w2,
             pt: pso_pt,
         };
+        let objects = Vec::<_>::with_capacity(255);
+        let inspector = InspectMenu::new(
+            &font,
+            [0.03, 0.03, 0.0, 1.0],
+        );
+
+        let layout = font.layout::<FontBundle<B::Resources, pipe_w2::Data<B::Resources>>>(
+            "".to_string(), [0.0, 0.0], [0.0;4], 0.1
+        );
+
         World {
             avators,
             camera,
             sampler,
             pso_set,
             font,
+            inspector,
             timer: coarsetime::Instant::now(),
             state: WorldState::Render,
-            inspector: InspectMenu {
-                color: [0.03, 0.03, 0.0],
-            }
+            objects,
+            layout
         }
     }
     fn camera(&self) -> &Camera<f32> {
@@ -669,16 +680,18 @@ impl<B: gfx::Backend> World<B, Vertex> {
         let screen_size = [screen_width as f32, screen_height as f32];
 
         if self.state == WorldState::Pose {
-            self.inspector.render(view, time, &self.pso_set, &self.font, encoder, &self.sampler, device, screen_size);
-        }
-
-        let camera = self.camera(); 
-        for obj in self.avators.target.values() {
-            obj.render(view, camera, time, &self.pso_set.pso, encoder,  &self.sampler);
+            self.inspector.update(view, &self.font, &self.sampler, device, screen_size, "hoge".to_string());
+            self.inspector.render(&self.pso_set, encoder);
         }
         {
-            let layout = &self.font.layout(format!("{:?}", &time), [0.0, 0.0], [0.0;4], 0.1);
-            layout.renderIntoView(view, self.camera(), &self.pso_set.w2, encoder, &self.sampler, device);
+            self.layout.update(&self.font, view, &self.camera.target, &self.sampler, device, format!("{:?}", &time));
+            self.layout.render(&self.pso_set.w2, encoder);
+        }
+
+
+        for obj in self.avators.target.values_mut() {
+            obj.update(encoder, view, &self.camera.target, time, &self.sampler);
+            obj.render(&self.pso_set.pso, encoder);
         }
     }
 
@@ -689,39 +702,50 @@ impl<B: gfx::Backend> World<B, Vertex> {
 }
 
 
-struct InspectMenu {
-    color: [f32; 3],
+struct InspectMenu<B: gfx::Backend> {
+    color: [f32; 4],
+    frame: Option<Bundle<B::Resources, pipe_p::Data<B::Resources>>>,
+    text: FontLayout<B, FontBundle<B::Resources, pipe_pt::Data<B::Resources>>>,
 }
 
-impl InspectMenu {
-        fn render<B: gfx::Backend, D: gfx::Device<B::Resources>> (
-            &self,
-            view: &View<B::Resources>,
-            time: f64,
-            pso_set: &PipelineStateObjectSet<B::Resources>,
-            font: &Font<B>,
-            encoder: &mut gfx::GraphicsEncoder<B>,
-            sampler: &gfx::handle::Sampler<B::Resources>,
-            device:  &mut D,
-            screen_size: [f32; 2],
+impl<B: gfx::Backend> InspectMenu<B> {
+    fn new(
+        font: &Font<B>,
+        color: [f32; 4],
+    ) -> Self {
+       InspectMenu {
+            color,
+            frame: None,
+            text: font.layout::<FontBundle<B::Resources, pipe_pt::Data<B::Resources>>>("".to_string(), [0.0, 0.0], [0.0;4], 0.1)
+        }
+    }
+    fn update<D: gfx::Device<B::Resources>> (
+        &mut self,
+        view: &View<B::Resources>,
+        font: &Font<B>,
+        sampler: &gfx::handle::Sampler<B::Resources>,
+        device:  &mut D,
+        screen_size: [f32; 2],
+        text: String,
         ) {
-            use gfx::traits::DeviceExt;
+        use gfx::traits::DeviceExt;
+        if let None = self.frame {
             let vertex_data = vec!(
                 VertexP {
                     position: [-0.95, 0.0, 0.0],
-                    color: [0.03, 0.03, 0.03, 0.9],
+                    color: self.color,
                 }, 
                 VertexP {
                     position: [0.95, 0.0, 0.0],
-                    color: [0.03, 0.03, 0.03, 0.9],
+                    color: self.color,
                 },
                 VertexP {
                     position: [-0.95, -0.95, 0.0],
-                    color: [0.03, 0.03, 0.03, 1.0],
+                    color: self.color,
                 },
                 VertexP {
                     position: [0.95,  -0.95, 0.0],
-                    color: [0.03, 0.03, 0.03, 1.0],
+                    color: self.color,
                 },
             );
 
@@ -733,13 +757,27 @@ impl InspectMenu {
                 screen_size,
                 cursor: [0.0, 0.0],
             };
-            encoder.draw(&slice, &pso_set.p, &data);
 
-            {
-                let layout = font.layout(format!("abc\n0efg"), [40.0, screen_size[1] / 2.0], [0.8, 0.8, 0.8, 1.0], 1.0);
-                layout.render(view, &pso_set.pt, encoder, sampler, device, screen_size);
-            }
+            self.frame = Some(
+                Bundle {
+                    slice,
+                    data,
+                }
+            );
         }
+        self.text.update(&font, view, sampler, device, screen_size, text);
+    }
+
+    fn render (
+        &self,
+        pso_set: &PipelineStateObjectSet<B::Resources>,
+        encoder: &mut gfx::GraphicsEncoder<B>,
+    ) {
+        if let Some(ref frame) = self.frame {
+            encoder.draw(&frame.slice, &pso_set.p, &frame.data);
+        }
+        self.text.render(&pso_set.pt, encoder);
+    }
 }
 
 
@@ -860,7 +898,7 @@ impl<B: gfx::Backend, V> Command<HashMap<i32, GameObject<B, V>>> for AvatorComma
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum Level {
     Avator,
-    World,
+    _World,
     System,
 }
 
@@ -1010,16 +1048,166 @@ fn entry_<'e, R, F, V, T>(device: &mut F, vertex_data: &[V], index_data: &[u32],
 }
 
 
+
+
+fn query_entry<
+    B: gfx::Backend,
+    D: gfx::Device<B::Resources>,
+    T: gfx::format::TextureFormat>(
+    conn: &Connection,
+    device: &mut D, 
+    ids: &[i32],
+) -> RusqliteResult<HashMap<i32, GameObject<B, Vertex>>> {
+    use gfx::traits::DeviceExt;
+
+    let mut result = HashMap::default();
+
+    for id in ids {
+        let meshes = query_mesh(&conn, id)?;
+        let joints = query_skeleton(&conn, id)?;
+        let animations = query_animation(&conn, id)?;
+        let entries = meshes.iter().map(|&(ref vertex_data, texture_id)| {
+            let img = query_texture::<TextureFormat>(&conn, texture_id).expect("failed to create texture");
+            entry(device, vertex_data.as_slice(), &img)
+        }).collect();
+
+        let skinning_buffer = device.create_constant_buffer(64);
+
+        result.insert(
+            id.clone(), 
+            GameObject {
+                entries,
+                position: Point3::new(0.0, 0.0, 0.0),
+                // front: Vector3::new(0.0, -1.0, 0.0)
+                joints,
+                animations,
+                skinning_buffer,
+                backend: std::marker::PhantomData::<B>,
+                bundle: None,
+            }
+        );
+    }
+    Ok(result)
+}
+
+
+struct GameObject<B: gfx::Backend, V> {
+    entries: Vec<Entry<B::Resources, V, [f32;4]>>,
+    position: Point3<f32>,
+    // front: Vector3<f32>,
+    joints: Vec<Joint>,
+    animations: Vec<Vec<(f32, Animation)>>,
+
+    skinning_buffer: gfx::handle::Buffer<B::Resources, Skinning>,
+
+    backend: std::marker::PhantomData<B>,
+    bundle: Option<Vec<Bundle<B::Resources, pipe_w::Data<B::Resources>>>>,
+}
+
+trait Translate<T: cgmath::BaseFloat> {
+    fn translate(&mut self, v: Vector3<T>);
+}
+
+impl<B: gfx::Backend, V> Translate<f32> for GameObject<B, V>
+{
+    fn translate(&mut self, v: Vector3<f32>) {
+        self.position += v;
+    }
+}
+impl<T: cgmath::BaseFloat> Translate<T> for Camera<T> {
+    fn translate(&mut self, v: Vector3<T>) {
+        self.position += v;
+    }
+}
+
+trait GraphicsComponent<
+    B: gfx::Backend,
+    D: gfx::Device<B::Resources>,
+> {
+    fn render(
+        &self,
+        view: &View<B::Resources>,
+        pso: &PipelineStateObjectSet<B::Resources>,
+        encoder: &mut gfx::GraphicsEncoder<B>,
+        sampler: &gfx::handle::Sampler<B::Resources>,
+        device: &mut D, 
+        screen_size: [f32; 2],
+    );
+}
+
+
+impl<B: gfx::Backend> GameObject<B, Vertex> {
+    fn update(
+        &mut self,
+        encoder: &mut gfx::GraphicsEncoder<B>,
+        view: &View<B::Resources>,
+        camera: &Camera<f32>,
+        elapsed: f64,
+        sampler: &gfx::handle::Sampler<B::Resources>,
+    ) {
+        let mv = camera.view * Matrix4::from_translation(self.position.to_vec());
+        let mvp = camera.perspective * mv;
+        {
+            let a = self.get_skinning(elapsed);
+            encoder.update_buffer(&self.skinning_buffer, &a, 0).expect("ub");
+        }
+        let bundle = self.entries.iter().map(|entry| {
+            let data = pipe_w::Data {
+                vbuf: entry.vertex_buffer.clone(),
+                u_model_view_proj: mvp.into(),
+                u_model_view: mv.into(),
+                u_light: [0.2, 0.2, -0.2f32],
+                u_ambient_color: [0.01, 0.01, 0.01, 1.0],
+                u_eye_direction: camera.direction().into(),
+                u_texture: (entry.texture.clone(), sampler.clone()),
+                out_color: view.0.clone(),
+                out_depth: view.1.clone(),
+                b_skinning: self.skinning_buffer.raw().clone(),
+            };
+            Bundle {
+                slice: entry.slice.clone(),
+                data,
+            }
+        }).collect();
+        self.bundle = Some(bundle);
+    }
+    fn render(
+        &self,
+        pso: &gfx::PipelineState<B::Resources, pipe_w::Meta>,
+        encoder: &mut gfx::GraphicsEncoder<B>,
+    ) {
+        if let Some(ref bundle) = self.bundle {
+            for entry in bundle {
+                encoder.draw(&entry.slice, pso, &entry.data);
+            }
+        }
+    }
+}
+
+struct Bundle<R: gfx::Resources, D: gfx::pso::PipelineData<R>> {
+    slice: gfx::Slice<R>,
+    data: D,
+}
+
+struct FontBundle<R: gfx::Resources, D: gfx::pso::PipelineData<R>> {
+    slice: gfx::Slice<R>,
+    data: D,
+    vertex_data: Vec<Vertex>,
+    index_data: Vec<u32>,
+}
+
 fn font_entry<B: gfx::Backend, R: gfx::Resources, D: gfx::Device<R>>(
     device: &mut D,
     font: &Font<B>,
+    vertex_data: &mut Vec<Vertex>,
+    index_data: &mut Vec<u32>,
     text: &str,
     pos: [f32;2],
     color: [f32;4],
     scale: f32) -> Entry<R, Vertex, f32> 
 {
-    let mut vertex_data = Vec::new();
-    let mut index_data = Vec::new();
+    vertex_data.clear();
+    index_data.clear();
 
     let (mut x, z, mut y) = (pos[0], 0.0, pos[1]);
 
@@ -1092,177 +1280,154 @@ fn font_entry<B: gfx::Backend, R: gfx::Resources, D: gfx::Device<R>>(
     )
 }
 
-fn query_entry<
-    B: gfx::Backend,
-    D: gfx::Device<B::Resources>,
-    T: gfx::format::TextureFormat>(
-    conn: &Connection,
-    device: &mut D, 
-    ids: &[i32],
-) -> RusqliteResult<HashMap<i32, GameObject<B, Vertex>>> {
-    use gfx::traits::DeviceExt;
 
-    let mut result = HashMap::default();
-
-    for id in ids {
-        let meshes = query_mesh(&conn, id)?;
-        let joints = query_skeleton(&conn, id)?;
-        let animations = query_animation(&conn, id)?;
-        let entries = meshes.iter().map(|&(ref vertex_data, texture_id)| {
-            let img = query_texture::<TextureFormat>(&conn, texture_id).expect("failed to create texture");
-            entry(device, vertex_data.as_slice(), &img)
-        }).collect();
-
-        let skinning_buffer = device.create_constant_buffer(64);
-
-        result.insert(
-            id.clone(), 
-            GameObject {
-                entries,
-                position: Point3::new(0.0, 0.0, 0.0),
-                // front: Vector3::new(0.0, -1.0, 0.0)
-                joints,
-                animations,
-                skinning_buffer,
-                time: 0.0,
-                backend: std::marker::PhantomData::<B>
-            }
-        );
+impl<B: gfx::Backend> FontLayout<B, FontBundle<B::Resources, pipe_pt::Data<B::Resources>>> {
+    fn should_update(&self, text: &str) -> bool {
+        self.text != text
     }
-    Ok(result)
-}
-
-
-struct GameObject<B: gfx::Backend, V> {
-    entries: Vec<Entry<B::Resources, V, [f32;4]>>,
-    position: Point3<f32>,
-    // front: Vector3<f32>,
-    joints: Vec<Joint>,
-    animations: Vec<Vec<(f32, Animation)>>,
-
-    skinning_buffer: gfx::handle::Buffer<B::Resources, Skinning>,
-    time: f32,
-
-    backend: std::marker::PhantomData<B>
-}
-
-trait Translate<T: cgmath::BaseFloat> {
-    fn translate(&mut self, v: Vector3<T>);
-}
-
-impl<B: gfx::Backend, V> Translate<f32> for GameObject<B, V>
-{
-    fn translate(&mut self, v: Vector3<f32>) {
-        self.position += v;
-    }
-}
-impl<T: cgmath::BaseFloat> Translate<T> for Camera<T> {
-    fn translate(&mut self, v: Vector3<T>) {
-        self.position += v;
-    }
-}
-
-trait GraphicsComponent<
-    B: gfx::Backend,
-    D: gfx::Device<B::Resources>,
-> {
-    fn render(
-        &self,
+    fn update<D: gfx::Device<B::Resources>>(
+        &mut self,
+        font: &Font<B>,
         view: &View<B::Resources>,
-        pso: &PipelineStateObjectSet<B::Resources>,
-        encoder: &mut gfx::GraphicsEncoder<B>,
-        sampler: &gfx::handle::Sampler<B::Resources>,
-        device: &mut D, 
-        screen_size: [f32; 2],
-    );
-}
-
-
-impl<B: gfx::Backend> GameObject<B, Vertex> {
-    fn render(
-        &self,
-        view: &View<B::Resources>,
-        camera: &Camera<f32>,
-        elapsed: f64,
-        pso: &gfx::PipelineState<B::Resources, pipe_w::Meta>,
-        encoder: &mut gfx::GraphicsEncoder<B>,
-        sampler: &gfx::handle::Sampler<B::Resources>,
-    ) {
-        let mv = camera.view * Matrix4::from_translation(self.position.to_vec());
-        let mvp = camera.perspective * mv;
-        {
-            let a = self.get_skinning(elapsed);
-            encoder.update_buffer(&self.skinning_buffer, &a, 0).expect("ub");
-        }
-        for entry in &self.entries {
-            let data = pipe_w::Data {
-                vbuf: entry.vertex_buffer.clone(),
-                u_model_view_proj: mvp.into(),
-                u_model_view: mv.into(),
-                u_light: [0.2, 0.2, -0.2f32],
-                u_ambient_color: [0.01, 0.01, 0.01, 1.0],
-                u_eye_direction: camera.direction().into(),
-                u_texture: (entry.texture.clone(), sampler.clone()),
-                out_color: view.0.clone(),
-                out_depth: view.1.clone(),
-                b_skinning: self.skinning_buffer.raw().clone(),
-            };
-            encoder.draw(&entry.slice, pso, &data);
-        }
-    }
-}
-
-impl<'a, B: gfx::Backend> FontLayout<'a, B> {
-    fn render<D: gfx::Device<B::Resources>>(
-        &self,
-        view: &View<B::Resources>,
-        pso: &gfx::PipelineState<B::Resources, pipe_pt::Meta>,
-        encoder: &mut gfx::GraphicsEncoder<B>,
         sampler: &gfx::handle::Sampler<B::Resources>,
         device:  &mut D,
         screen_size: [f32; 2],
+        text: String,
     ) {
-        let font_entry = font_entry(device, &self.font, &self.text, self.position, self.color, self.scale);
+        if self.should_update(&text) {
+            match self.data {
+                Some(FontBundle {
+                    ref mut data,
+                    ref mut slice,
+                    ref mut vertex_data,
+                    ref mut index_data,
+                }) => {
+                    let font_entry = font_entry(device, font, vertex_data, index_data, &text, self.position, self.color, self.scale);
+                    *data = pipe_pt::Data {
+                        vbuf: font_entry.vertex_buffer,
+                        u_texture: (font_entry.texture, sampler.clone()),
+                        out_color: view.0.clone(),
+                        out_depth: view.1.clone(),
+                        screen_size
+                    };
+                    *slice = font_entry.slice;
+                },
+                None => {
+                    println!("assigned");
+                    
+                    let mut vertex_data = Vec::with_capacity(255);
+                    let mut index_data = Vec::with_capacity(255);
 
-        let data = pipe_pt::Data {
-            vbuf: font_entry.vertex_buffer,
-            u_texture: (font_entry.texture, sampler.clone()),
-            out_color: view.0.clone(),
-            out_depth: view.1.clone(),
-            screen_size
-        };
-        encoder.draw(&font_entry.slice, pso, &data);
+                    let font_entry = font_entry(device, font, &mut vertex_data, &mut index_data, &text, self.position, self.color, self.scale);
+                    let data = pipe_pt::Data {
+                        vbuf: font_entry.vertex_buffer,
+                        u_texture: (font_entry.texture, sampler.clone()),
+                        out_color: view.0.clone(),
+                        out_depth: view.1.clone(),
+                        screen_size
+                    };
+
+                    self.data = Some(FontBundle {
+                        data, 
+                        slice: font_entry.slice,
+                        index_data,
+                        vertex_data
+                    });
+                }
+            };
+        }
+        self.text = text;
+    }
+
+    fn render(
+        &self,
+        pso: &gfx::PipelineState<B::Resources, pipe_pt::Meta>,
+        encoder: &mut gfx::GraphicsEncoder<B>,
+    ) {
+        if let Some(ref bundle) = self.data {
+            encoder.draw(&bundle.slice, pso, &bundle.data);
+        }
     }
 }
 
-impl<'a, B: gfx::Backend> FontLayout<'a, B> {
-    fn renderIntoView<D: gfx::Device<B::Resources>>(
-        &self,
+impl<B: gfx::Backend> FontLayout<B, FontBundle<B::Resources, pipe_w2::Data<B::Resources>>> {
+    fn should_update(&self, text: &str) -> bool {
+        self.text != text
+    }
+    fn update<D: gfx::Device<B::Resources>>(
+        &mut self,
+        font: &Font<B>,
         view: &View<B::Resources>,
         camera: &Camera<f32>,
-        pso: &gfx::PipelineState<B::Resources, pipe_w2::Meta>,
-        encoder: &mut gfx::GraphicsEncoder<B>,
         sampler: &gfx::handle::Sampler<B::Resources>,
         device:  &mut D, 
-        ) {
-        let font_entry = font_entry(device, &self.font, &self.text, self.position, self.color, self.scale);
+        text: String,
+    ) {
 
-        let data = pipe_w2::Data {
-            vbuf: font_entry.vertex_buffer,
-            u_model_view_proj: camera.projection.into(),
-            u_model_view: camera.view.into(),
-            u_light: [1.0, 0.5, -0.5f32],
-            u_ambient_color: [0.00, 0.00, 0.01, 0.4],
-            u_eye_direction: camera.direction().into(),
-            u_texture: (font_entry.texture, sampler.clone()),
-            out_color: view.0.clone(),
-            out_depth: view.1.clone()
-        };
-        encoder.draw(&font_entry.slice, pso, &data);
+        if self.should_update(&text) {
+            match self.data {
+                Some(FontBundle {
+                    ref mut data,
+                    ref mut slice,
+                    ref mut vertex_data,
+                    ref mut index_data,
+                    ..
+                }) => {
+
+                    let font_entry = font_entry(device, font, vertex_data, index_data, &text, self.position, self.color, self.scale);
+
+                    *data = pipe_w2::Data {
+                        vbuf: font_entry.vertex_buffer,
+                        u_model_view_proj: camera.projection.into(),
+                        u_model_view: camera.view.into(),
+                        u_light: [1.0, 0.5, -0.5f32],
+                        u_ambient_color: [0.00, 0.00, 0.01, 0.4],
+                        u_eye_direction: camera.direction().into(),
+                        u_texture: (font_entry.texture, sampler.clone()),
+                        out_color: view.0.clone(),
+                        out_depth: view.1.clone()
+                    };
+                    *slice = font_entry.slice;
+               }, 
+                None => {
+                    let mut vertex_data = Vec::with_capacity(255);
+                    let mut index_data = Vec::with_capacity(255);
+                    let font_entry = font_entry(device, font, &mut vertex_data, &mut index_data, &text, self.position, self.color, self.scale);
+
+                    let data = pipe_w2::Data {
+                        vbuf: font_entry.vertex_buffer,
+                        u_model_view_proj: camera.projection.into(),
+                        u_model_view: camera.view.into(),
+                        u_light: [1.0, 0.5, -0.5f32],
+                        u_ambient_color: [0.00, 0.00, 0.01, 0.4],
+                        u_eye_direction: camera.direction().into(),
+                        u_texture: (font_entry.texture, sampler.clone()),
+                        out_color: view.0.clone(),
+                        out_depth: view.1.clone()
+                    };
+                    self.data = Some(FontBundle {
+                        data, 
+                        slice: font_entry.slice,
+                        vertex_data,
+                        index_data
+                    });
+
+                }
+            }
+        }
+    }
+
+    fn render(
+        &self,
+        pso: &gfx::PipelineState<B::Resources, pipe_w2::Meta>,
+        encoder: &mut gfx::GraphicsEncoder<B>,
+        ) {
+        if let Some(ref bundle) = self.data {
+            encoder.draw(&bundle.slice, pso, &bundle.data);
+        }
+
     }
 }
-
-
 
 impl<B: gfx::Backend, V> GameObject<B, V> {
     fn get_skinning(&self, time: f64) -> Vec<Skinning> {
